@@ -1,0 +1,53 @@
+# Force refresh workflow parsing
+name: 24h Clean Hash Sync Pipeline
+
+on:
+  schedule:
+    - cron: '0 0 * * *' # Automatically runs every night at 00:00 UTC
+  workflow_dispatch: # Allows manual trigger from the GitHub web UI at any time
+
+# Default GITHUB_TOKEN is read-only; release upload needs contents:write.
+permissions:
+  contents: write
+
+jobs:
+  build-and-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Monorepo Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Runtime Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Execute In-Memory Stream Parser
+        run: |
+          # Streams remote hash list into native CVT1 packs under ./clean_packs
+          python tools/stream_http_hash_filter.py \
+            "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/rds_2026.03.1/RDS_2026.03.1_modern.zip" \
+            -o clean_packs
+
+      - name: Deploy Native CVT1 Binary Feed to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest-feed
+          name: "Latest Clean Hash Feed (CVT1 Packs)"
+          body: "Automated 24h zero-footprint binary hash feed generation for the core scanning engine."
+          make_latest: true
+          files: |
+            clean_packs/clean_md5.bin
+            clean_packs/clean_sha1.bin
+            clean_packs/clean_sha256.bin
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

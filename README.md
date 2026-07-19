@@ -1,0 +1,218 @@
+\# ⚡ NIST NSRL Live CVT1 Feed Pipeline
+
+
+
+An automated, high-performance, \*\*zero-disk footprint\*\* threat intelligence pipeline that parses the massive (\~120 GB) NIST NSRL Modern database entirely in-memory, generates daily micro-sized native binary hash feeds (CVT1 format), and deploys them directly to GitHub Releases.
+
+
+
+\---
+
+
+
+\## 🧠 The Engineering Problem \& Architecture
+
+
+
+\### The Constraint
+
+The official NIST NSRL Modern SQLite database is a massive \*\*\~120 GB\*\* monolith. Standard implementations require downloading the entire archive, extracting it to disk, and running heavy SQL queries. Doing this on cloud infrastructure or free-tier automation layers like GitHub Actions is impossible due to the strict \*\*14 GB disk space limit\*\* and performance bottlenecks.
+
+
+
+\### The Solution: SQLite Page Carving \& Ring Buffer
+
+This project completely bypasses the local storage layer and the SQLite engine itself:
+
+1\. \*\*Network Stream to Inflation:\*\* The remote `.zip` file is streamed via HTTP chunks and decompressed (inflated) on the fly.
+
+2\. \*\*Circular Ring Buffer:\*\* Decompressed raw binary `.db` bytes are pushed into a highly optimized, custom multi-threaded \*\*Circular Ring Buffer\*\* (`ByteRing` class).
+
+3\. \*\*Low-Level Page Carving:\*\* Instead of initializing a traditional SQLite database connection (which demands random-access `seek` operations across the entire 120 GB file structure), a custom \*\*Binary Carver\*\* sequentially scans the byte stream in file order. It parses the physical SQLite page/cell boundaries on the fly, extracts valid `MD5`, `SHA-1`, and `SHA-256` columns, and drops everything else.
+
+4\. \*\*Zero-Overhead Binary Packs (CVT1):\*\* Extracted hashes are strictly packed as raw binary streams (16 bytes for MD5, 20 bytes for SHA-1, 32 bytes for SHA-256) instead of bulky ASCII text hex strings.
+
+
+
+\---
+
+
+
+\## 📊 Live Feed Statistics (Compression Miracle)
+
+
+
+Thanks to the elimination of SQLite B-Tree metadata fragmentation, index headers, and raw text representations, the massive database overhead collapses into tightly packed high-performance files:
+
+
+
+| Artifact Name | Native Format | Element Size | Total Packed Size | Target Population |
+
+| :--- | :--- | :--- | :--- | :--- |
+
+| 📦 `clean\_md5.bin` | Raw Binary | 16 Bytes | \~10.2 MB | \~668,000 Hashes |
+
+| 📦 `clean\_sha1.bin` | Raw Binary | 20 Bytes | \~12.7 MB | \~665,000 Hashes |
+
+| 📦 `clean\_sha256.bin` | Raw Binary | 32 Bytes | \~20.4 MB | \~668,000 Hashes |
+
+
+
+\*Feeds are completely refreshed and re-generated every 24 hours via automated pipelines.\*
+
+
+
+\---
+
+
+
+\## 🚀 Integration Guide: How to Use CVT1 Feeds in Your Project
+
+
+
+Because the feeds are deployed as pure, un-padded binary structures, you don't need heavy JSON/CSV/SQL parsers. You can directly integrate them into your malware scanning engines, sandbox environments, or whitelist checkers.
+
+
+
+\### 1. Integration in C/C++ (Zero-Copy Memory Mapping)
+
+You can directly map the `.bin` files into memory using `mmap` for instant, zero-allocation runtime space lookups:
+
+
+
+```cpp
+
+\#include <iostream>
+
+\#include <fcntl.h>
+
+\#include <sys/mman.h>
+
+\#include <sys/stat.h>
+
+\#include <unistd.h>
+
+
+
+struct SHA256Hash {
+
+&#x20;   uint8\_t bytes\[32];
+
+};
+
+
+
+int main() {
+
+&#x20;   int fd = open("clean\_sha256.bin", O\_RDONLY);
+
+&#x20;   if (fd < 0) return 1;
+
+
+
+&#x20;   struct stat sb;
+
+&#x20;   fstat(fd, \&sb);
+
+
+
+&#x20;   // Memory-map the entire feed instantly
+
+&#x20;   SHA256Hash\* hash\_feed = (SHA256Hash\*)mmap(NULL, sb.st\_size, PROT\_READ, MAP\_SHARED, fd, 0);
+
+&#x20;   size\_t total\_hashes = sb.st\_size / sizeof(SHA256Hash);
+
+
+
+&#x20;   std::cout << "\[+] Instantly mapped " << total\_hashes << " hashes into runtime space." << std::endl;
+
+
+
+&#x20;   // Perform ultra-fast O(log N) binary search here since the array is pre-sorted
+
+&#x20;   // Example:std::binary\_search(hash\_feed, hash\_feed + total\_hashes, target\_hash);
+
+
+
+&#x20;   munmap(hash\_feed, sb.st\_size);
+
+&#x20;   close(fd);
+
+&#x20;   return 0;
+
+}
+```
+
+### 2. Integration in Python (Struct Unpacking)
+If you want to read or query the generated binary files using Python, you can unpack the CVT1 headers like this:
+```
+import struct
+
+from pathlib import Path
+
+
+
+def parse\_cvt1\_pack(bin\_path: str):
+
+&#x20;   path = Path(bin\_path)
+
+&#x20;   if not path.exists():
+
+&#x20;       return \[]
+
+&#x20;   data = path.read\_bytes()
+
+&#x20;   header\_format = "<IIIQI"
+
+&#x20;   header\_size = struct.calcsize(header\_format)
+
+&#x20;   if len(data) < header\_size:
+
+&#x20;       return \[]
+
+&#x20;   magic, version, algo, timestamp, count = struct.unpack\_from(header\_format, data, 0)
+
+&#x20;   algo\_sizes = {1: 16, 2: 20, 3: 32}
+
+&#x20;   if algo not in algo\_sizes:
+
+&#x20;       return \[]
+
+&#x20;   hash\_size = algo\_sizes\[algo]
+
+&#x20;   hashes = \[]
+
+&#x20;   offset = header\_size
+
+&#x20;   for \_ in range(count):
+
+&#x20;       if offset + hash\_size > len(data):
+
+&#x20;           break
+
+&#x20;       hashes.append(data\[offset : offset + hash\_size].hex())
+
+&#x20;       offset += hash\_size
+
+&#x20;   return hashes
+```
+## 🛠️ Running the Infrastructure Locally
+
+You can run the exact pipeline logic on your local machine without downloading the database to your hard drive.
+
+###Prerequisites
+pip install requests
+
+###Run the Carver Stream
+python tools/stream\_http\_hash\_filter.py "TARGET\_NIST\_ZIP\_URL" --mode carve --ring-mb 512
+
+Note: Memory allocations will safely hover around your --ring-mb value while processing 100+ GB over the network pipeline.
+
+## 🛡️ Maintainer \& Author
+Cemil Emre Bıyık - Computer Systems \& Low-Level Security Architecture Enthusiast.
+
+## 📄 License
+This project is licensed under the MIT License - see the LICENSE file for details.
+
+
+
