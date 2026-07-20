@@ -1,44 +1,43 @@
-\# ⚡ NIST NSRL Live CVT1 Feed Pipeline
+# ⚡ NIST NSRL Live CVT1 Feed Pipeline
+
+
+An automated, high-performance, **zero-disk footprint** threat intelligence pipeline that parses the massive (\~120 GB) NIST NSRL Modern database entirely in-memory, generates daily micro-sized native binary hash feeds (CVT1 format), and deploys them directly to GitHub Releases.
 
 
 
-An automated, high-performance, \*\*zero-disk footprint\*\* threat intelligence pipeline that parses the massive (\~120 GB) NIST NSRL Modern database entirely in-memory, generates daily micro-sized native binary hash feeds (CVT1 format), and deploys them directly to GitHub Releases.
+---
 
 
 
-\---
+## 🧠 The Engineering Problem \& Architecture
 
 
 
-\## 🧠 The Engineering Problem \& Architecture
+### The Constraint
+
+The official NIST NSRL Modern SQLite database is a massive **\~120 GB** monolith. Standard implementations require downloading the entire archive, extracting it to disk, and running heavy SQL queries. Doing this on cloud infrastructure or free-tier automation layers like GitHub Actions is impossible due to the strict **14 GB disk space limit** and performance bottlenecks.
 
 
 
-\### The Constraint
-
-The official NIST NSRL Modern SQLite database is a massive \*\*\~120 GB\*\* monolith. Standard implementations require downloading the entire archive, extracting it to disk, and running heavy SQL queries. Doing this on cloud infrastructure or free-tier automation layers like GitHub Actions is impossible due to the strict \*\*14 GB disk space limit\*\* and performance bottlenecks.
-
-
-
-\### The Solution: SQLite Page Carving \& Ring Buffer
+### The Solution: SQLite Page Carving \& Ring Buffer
 
 This project completely bypasses the local storage layer and the SQLite engine itself:
 
-1\. \*\*Network Stream to Inflation:\*\* The remote `.zip` file is streamed via HTTP chunks and decompressed (inflated) on the fly.
+1\. **Network Stream to Inflation:** The remote `.zip` file is streamed via HTTP chunks and decompressed (inflated) on the fly.
 
-2\. \*\*Circular Ring Buffer:\*\* Decompressed raw binary `.db` bytes are pushed into a highly optimized, custom multi-threaded \*\*Circular Ring Buffer\*\* (`ByteRing` class).
+2\. **Circular Ring Buffer:** Decompressed raw binary `.db` bytes are pushed into a highly optimized, custom multi-threaded **Circular Ring Buffer** (`ByteRing` class).
 
-3\. \*\*Low-Level Page Carving:\*\* Instead of initializing a traditional SQLite database connection (which demands random-access `seek` operations across the entire 120 GB file structure), a custom \*\*Binary Carver\*\* sequentially scans the byte stream in file order. It parses the physical SQLite page/cell boundaries on the fly, extracts valid `MD5`, `SHA-1`, and `SHA-256` columns, and drops everything else.
+3\. **Low-Level Page Carving:** Instead of initializing a traditional SQLite database connection (which demands random-access `seek` operations across the entire 120 GB file structure), a custom **Binary Carver** sequentially scans the byte stream in file order. It parses the physical SQLite page/cell boundaries on the fly, extracts valid `MD5`, `SHA-1`, and `SHA-256` columns, and drops everything else.
 
-4\. \*\*Zero-Overhead Binary Packs (CVT1):\*\* Extracted hashes are strictly packed as raw binary streams (16 bytes for MD5, 20 bytes for SHA-1, 32 bytes for SHA-256) instead of bulky ASCII text hex strings.
-
-
-
-\---
+4\. **Zero-Overhead Binary Packs (CVT1):** Extracted hashes are strictly packed as raw binary streams (16 bytes for MD5, 20 bytes for SHA-1, 32 bytes for SHA-256) instead of bulky ASCII text hex strings.
 
 
 
-\## 📊 Live Feed Statistics (Compression Miracle)
+---
+
+
+
+## 📊 Live Feed Statistics (Compression Miracle)
 
 
 
@@ -58,15 +57,15 @@ Thanks to the elimination of SQLite B-Tree metadata fragmentation, index headers
 
 
 
-\*Feeds are completely refreshed and re-generated every 24 hours via automated pipelines.\*
+*Feeds are completely refreshed and re-generated every 24 hours via automated pipelines.*
 
 
 
-\---
+---
 
 
 
-\## 🚀 Integration Guide: How to Use CVT1 Feeds in Your Project
+## 🚀 Integration Guide: How to Use CVT1 Feeds in Your Project
 
 
 
@@ -74,7 +73,8 @@ Because the feeds are deployed as pure, un-padded binary structures, you don't n
 
 
 
-\### 1. Integration in C/C++ (Zero-Copy Memory Mapping)
+
+### 1. Integration in C/C++ (Zero-Copy Memory Mapping)
 
 You can directly map the `.bin` files into memory using `mmap` for instant, zero-allocation runtime space lookups:
 
@@ -196,14 +196,14 @@ def parse\_cvt1\_pack(bin\_path: str):
 
 &#x20;   return hashes
 ```
-## 🛠️ Running the Infrastructure Locally
 
+## 🛠️ Running the Infrastructure Locally
 You can run the exact pipeline logic on your local machine without downloading the database to your hard drive.
 
-###Prerequisites
+### Prerequisites
 pip install requests
 
-###Run the Carver Stream
+### Run the Carver Stream
 python tools/stream\_http\_hash\_filter.py "TARGET\_NIST\_ZIP\_URL" --mode carve --ring-mb 512
 
 Note: Memory allocations will safely hover around your --ring-mb value while processing 100+ GB over the network pipeline.
