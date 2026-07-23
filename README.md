@@ -37,7 +37,7 @@ This project completely bypasses the local storage layer and the SQLite engine i
 
 
 
-## 📊 Live Feed Statistics (Compression Miracle)
+## 📊 Live Feed Statistics
 
 
 
@@ -46,14 +46,10 @@ Thanks to the elimination of SQLite B-Tree metadata fragmentation, index headers
 
 
 | Artifact Name | Native Format | Element Size | Total Packed Size | Target Population |
-
 | :--- | :--- | :--- | :--- | :--- |
-
-| 📦 `clean\_md5.bin` | Raw Binary | 16 Bytes | \~10.2 MB | \~668,000 Hashes |
-
-| 📦 `clean\_sha1.bin` | Raw Binary | 20 Bytes | \~12.7 MB | \~665,000 Hashes |
-
-| 📦 `clean\_sha256.bin` | Raw Binary | 32 Bytes | \~20.4 MB | \~668,000 Hashes |
+| 📦 `clean_md5.bin` | Raw Binary | 16 Bytes | ~10.2 MB | ~668,000 Hashes |
+| 📦 `clean_sha1.bin` | Raw Binary | 20 Bytes | ~12.7 MB | ~665,000 Hashes |
+| 📦 `clean_sha256.bin` | Raw Binary | 32 Bytes | ~20.4 MB | ~668,000 Hashes |
 
 
 
