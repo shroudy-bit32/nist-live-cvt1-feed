@@ -4,6 +4,12 @@ An automated, high-performance, **zero-disk footprint** threat intelligence pipe
 
 ---
 
+# ⚡ NIST NSRL Live CVT1 & DFIR Hash Feed Pipeline
+
+An automated, high-performance, **zero-disk footprint** threat intelligence pipeline that parses the massive (~120 GB) NIST NSRL Modern database entirely in-memory. It generates daily micro-sized native binary hash feeds (CVT1 format) for high-performance engines, alongside **DFIR-compatible plain-text lists** (for Magnet AXIOM, FTK, etc.), deploying them directly to GitHub Releases.
+
+---
+
 ## 🧠 The Engineering Problem & Architecture
 
 ### The Constraint
@@ -21,7 +27,6 @@ This project completely bypasses the local storage layer and the SQLite engine i
 
 ---
 
-
 ## 📊 Live Feed Statistics
 
 Thanks to the elimination of SQLite B-Tree metadata fragmentation and index headers, the massive database overhead collapses into tightly packed files available in two flavors:
@@ -37,21 +42,11 @@ Thanks to the elimination of SQLite B-Tree metadata fragmentation and index head
 
 > *Feeds are completely refreshed and re-generated every 24 hours via automated pipelines.*
 
-
-
 ---
 
-
-
-## 🚀 Integration Guide: How to Use CVT1 Feeds in Your Project
-
-
+## 🚀 Integration Guide: How to Use the Feeds
 
 Because the feeds are deployed as pure, un-padded binary structures, you don't need heavy JSON/CSV/SQL parsers. You can directly integrate them into your malware scanning engines, sandbox environments, or whitelist checkers.
-
-
-
-## 🚀 Integration Guide: How to Use the Feeds
 
 ### 1. DFIR Tools & Standard Software (Magnet AXIOM, FTK, SIEMs)
 Simply download the `.txt` artifacts from the latest Release. These are standard, pre-cleaned, line-separated ASCII hex lists. You can ingest them directly into Magnet AXIOM, Autopsy, FTK, or any SIEM/Sandbox environment for instant whitelisting.
@@ -59,67 +54,40 @@ Simply download the `.txt` artifacts from the latest Release. These are standard
 ### 2. Integration in C/C++ (Zero-Copy Memory Mapping)
 For custom engines, you can directly map the native `.bin` files into memory using `mmap` for instant, zero-allocation runtime space lookups:
 
-
 ```cpp
-
-\#include <iostream>
-
-\#include <fcntl.h>
-
-\#include <sys/mman.h>
-
-\#include <sys/stat.h>
-
-\#include <unistd.h>
-
-
+#include <iostream>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 struct SHA256Hash {
-
-&#x20;   uint8\_t bytes\[32];
-
+    uint8_t bytes[32];
 };
 
-
-
 int main() {
+    int fd = open("clean_sha256.bin", O_RDONLY);
+    if (fd < 0) return 1;
 
-&#x20;   int fd = open("clean\_sha256.bin", O\_RDONLY);
+    struct stat sb;
+    fstat(fd, &sb);
 
-&#x20;   if (fd < 0) return 1;
+    // Memory-map the entire feed instantly (Skip 24-byte CVT1 header)
+    size_t data_size = sb.st_size - 24;
+    size_t total_hashes = data_size / sizeof(SHA256Hash);
+    
+    // Map the file
+    uint8_t* map_ptr = (uint8_t*)mmap(NULL, sb.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    SHA256Hash* hash_feed = (SHA256Hash*)(map_ptr + 24);
 
+    std::cout << "[+] Instantly mapped " << total_hashes << " hashes into runtime space." << std::endl;
 
+    // Perform ultra-fast O(log N) binary search here since the array is pre-sorted
+    // Example: std::binary_search(hash_feed, hash_feed + total_hashes, target_hash);
 
-&#x20;   struct stat sb;
-
-&#x20;   fstat(fd, \&sb);
-
-
-
-&#x20;   // Memory-map the entire feed instantly
-
-&#x20;   SHA256Hash\* hash\_feed = (SHA256Hash\*)mmap(NULL, sb.st\_size, PROT\_READ, MAP\_SHARED, fd, 0);
-
-&#x20;   size\_t total\_hashes = sb.st\_size / sizeof(SHA256Hash);
-
-
-
-&#x20;   std::cout << "\[+] Instantly mapped " << total\_hashes << " hashes into runtime space." << std::endl;
-
-
-
-&#x20;   // Perform ultra-fast O(log N) binary search here since the array is pre-sorted
-
-&#x20;   // Example:std::binary\_search(hash\_feed, hash\_feed + total\_hashes, target\_hash);
-
-
-
-&#x20;   munmap(hash\_feed, sb.st\_size);
-
-&#x20;   close(fd);
-
-&#x20;   return 0;
-
+    munmap(map_ptr, sb.st_size);
+    close(fd);
+    return 0;
 }
 ```
 
