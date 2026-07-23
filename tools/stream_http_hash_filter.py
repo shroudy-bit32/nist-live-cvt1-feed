@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HTTP stream → clean CVT1 hash packs for CUDA_VT.
+HTTP stream → clean CVT1 hash packs.
 
 RDSv3 zip path (default) — root fix for GitHub runner disk limits
 -----------------------------------------------------------------
@@ -36,8 +36,10 @@ import tempfile
 import threading
 import time
 import zlib
+from datetime import date
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 CHUNK_SIZE = 64 * 1024
@@ -56,6 +58,22 @@ ZIP_DATA_DESC_SIG = b"PK\x07\x08"
 
 DEFAULT_ZIP_MEMBER = "RDS_*_modern/RDS_*_modern.db"
 
+HTTP_USER_AGENT = "CUDA_VT-stream-hash-filter/2.0"
+NSRL_DOWNLOAD_PAGE = (
+    "https://www.nist.gov/itl/csd/secure-systems-and-applications/"
+    "national-software-reference-library-nsrl/nsrl-download-0"
+)
+NSRL_S3_BASE = "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS"
+_S3_ZIP_HREF = re.compile(
+    r"https?://s3\.amazonaws\.com/rds\.nsrl\.nist\.gov/RDS/"
+    r"rds_[^\"\s<>]+/RDS_[^\"\s<>]+\.zip",
+    re.IGNORECASE,
+)
+_FULL_MODERN_ZIP_NAME = re.compile(
+    r"^RDS_(\d{4}\.\d{2}\.\d+)_modern\.zip$",
+    re.IGNORECASE,
+)
+
 _HEX_DIGEST = re.compile(
     r"(?i)^(?:md5:|sha1:|sha-1:|sha256:|sha-256:)?([0-9a-f]{32}|[0-9a-f]{40}|[0-9a-f]{64})$"
 )
@@ -64,6 +82,84 @@ _HEX_DIGEST = re.compile(
 def looks_like_digest(hex_str: str) -> bool:
     n = len(hex_str)
     return n in (32, 40, 64) and all(c in "0123456789abcdef" for c in hex_str)
+
+
+def _rds_version_key(version: str) -> Tuple[int, ...]:
+    return tuple(int(part) for part in version.split("."))
+
+
+def _modern_zip_url(version: str) -> str:
+    return f"{NSRL_S3_BASE}/rds_{version}/RDS_{version}_modern.zip"
+
+
+def _is_full_modern_zip_url(url: str) -> Optional[str]:
+    """Return RDS version if URL is full modern.zip (not minimal/delta)."""
+    name = url.rstrip("/").rsplit("/", 1)[-1]
+    m = _FULL_MODERN_ZIP_NAME.fullmatch(name)
+    return m.group(1) if m else None
+
+
+def _http_url_exists(url: str, timeout: int = 30) -> bool:
+    req = Request(url, method="HEAD", headers={"User-Agent": HTTP_USER_AGENT})
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            return 200 <= getattr(resp, "status", 200) < 300
+    except HTTPError as exc:
+        return 200 <= exc.code < 300
+    except URLError:
+        return False
+
+
+def _candidate_rds_versions(years_back: int = 5) -> List[str]:
+    """Quarterly RDS version candidates, newest first (incl. possible .2/.3 revisions)."""
+    today = date.today()
+    out: List[str] = []
+    for year in range(today.year, today.year - years_back - 1, -1):
+        for month in (12, 9, 6, 3):
+            if year == today.year and month > today.month:
+                continue
+            for rev in range(9, 0, -1):
+                out.append(f"{year}.{month:02d}.{rev}")
+    return out
+
+
+def discover_latest_rds_modern_zip(timeout: int = 60) -> str:
+    """
+    Resolve the newest full RDSv3 modern zip URL.
+
+    Prefers links on the official NIST download page, then falls back to
+    HEAD-probing S3 for RDS_*_modern.zip (excludes *_minimal* and *_delta*).
+    """
+    versions: Dict[str, str] = {}
+
+    try:
+        req = Request(NSRL_DOWNLOAD_PAGE, headers={"User-Agent": HTTP_USER_AGENT})
+        with urlopen(req, timeout=timeout) as resp:
+            html = resp.read().decode("utf-8", "replace")
+        for href in _S3_ZIP_HREF.findall(html):
+            ver = _is_full_modern_zip_url(href)
+            if ver:
+                versions[ver] = href
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        print(f"[!] NIST page discovery failed: {exc}", file=sys.stderr)
+
+    if versions:
+        latest = max(versions, key=_rds_version_key)
+        url = versions[latest]
+        print(f"[*] Discovered latest full modern zip from NIST page: {latest}", file=sys.stderr)
+        return url
+
+    print("[*] Falling back to S3 HEAD probe for RDS_*_modern.zip …", file=sys.stderr)
+    for ver in _candidate_rds_versions():
+        url = _modern_zip_url(ver)
+        if _http_url_exists(url, timeout=min(30, timeout)):
+            print(f"[*] Discovered latest full modern zip via S3: {ver}", file=sys.stderr)
+            return url
+
+    raise RuntimeError(
+        "Could not discover a full RDS_*_modern.zip "
+        "(not minimal/delta). Pass an explicit URL instead."
+    )
 
 
 def hex_to_raw(hex_str: str) -> bytes:
@@ -414,12 +510,12 @@ class HttpByteStream:
                 self.url,
                 stream=True,
                 timeout=self.timeout,
-                headers={"User-Agent": "CUDA_VT-stream-hash-filter/2.0"},
+                headers={"User-Agent": HTTP_USER_AGENT},
             )
             self._resp.raise_for_status()
             self._iter = self._resp.iter_content(chunk_size=self.chunk_size)
         except ImportError:
-            req = Request(self.url, headers={"User-Agent": "CUDA_VT-stream-hash-filter/2.0"})
+            req = Request(self.url, headers={"User-Agent": HTTP_USER_AGENT})
             self._resp = urlopen(req, timeout=self.timeout)
             self._use_requests = False
 
@@ -1009,7 +1105,21 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("url", help="HTTP(S) URL (RDSv3 .zip / .gz / text)")
+    src = ap.add_mutually_exclusive_group(required=True)
+    src.add_argument(
+        "url",
+        nargs="?",
+        default=None,
+        help="HTTP(S) URL (RDSv3 .zip / .gz / text)",
+    )
+    src.add_argument(
+        "--latest-modern",
+        action="store_true",
+        help=(
+            "Auto-discover the newest full RDS_*_modern.zip from NIST "
+            "(skips *_minimal* and *_delta*)"
+        ),
+    )
     ap.add_argument(
         "--encoding",
         choices=("auto", "zip", "gzip", "zlib", "raw", "none"),
@@ -1040,9 +1150,18 @@ def main() -> int:
     ap.add_argument("--format", choices=("bin", "text"), default="bin")
     args = ap.parse_args()
 
-    enc = guess_encoding(args.url, args.encoding)
+    if args.latest_modern:
+        try:
+            url = discover_latest_rds_modern_zip(timeout=min(60, args.timeout))
+        except Exception as exc:
+            print(f"[!] {exc}", file=sys.stderr)
+            return 2
+    else:
+        url = args.url
+
+    enc = guess_encoding(url, args.encoding)
     print(
-        f"[*] {args.url}\n"
+        f"[*] {url}\n"
         f"    encoding={enc} mode={args.mode} ring_mb={args.ring_mb} "
         f"max_keep={args.max_keep}",
         file=sys.stderr,
@@ -1050,7 +1169,7 @@ def main() -> int:
 
     try:
         accepted = stream_filter_hashes(
-            args.url,
+            url,
             encoding=args.encoding,
             zip_member=args.member,
             mode=args.mode,

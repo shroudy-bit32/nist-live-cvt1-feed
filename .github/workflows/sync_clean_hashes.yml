@@ -32,10 +32,9 @@ jobs:
 
       - name: Execute In-Memory Stream Parser
         run: |
-          # Streams remote hash list into native CVT1 packs under ./clean_packs
-          python tools/stream_http_hash_filter.py \
-            "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/rds_2026.03.1/RDS_2026.03.1_modern.zip" \
-            -o clean_packs
+          # Auto-discovers newest full RDS_*_modern.zip (skips minimal/delta),
+          # then streams it into native CVT1 packs under ./clean_packs
+          python tools/stream_http_hash_filter.py --latest-modern -o clean_packs
 
       - name: Deploy Native CVT1 Binary Feed to GitHub Releases
         uses: softprops/action-gh-release@v2

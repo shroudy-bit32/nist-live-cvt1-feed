@@ -204,7 +204,10 @@ You can run the exact pipeline logic on your local machine without downloading t
 pip install requests
 
 ###Run the Carver Stream
-python tools/stream\_http\_hash\_filter.py "TARGET\_NIST\_ZIP\_URL" --mode carve --ring-mb 512
+python tools/stream\_http\_hash\_filter.py --latest-modern --mode carve --ring-mb 512
+
+# Or pin an explicit NIST zip URL:
+# python tools/stream_http_hash_filter.py "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/rds_YYYY.MM.N/RDS_YYYY.MM.N_modern.zip" --mode carve --ring-mb 512
 
 Note: Memory allocations will safely hover around your --ring-mb value while processing 100+ GB over the network pipeline.
 
