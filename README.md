@@ -4,12 +4,6 @@ An automated, high-performance, **zero-disk footprint** threat intelligence pipe
 
 ---
 
-# ⚡ NIST NSRL Live CVT1 & DFIR Hash Feed Pipeline
-
-An automated, high-performance, **zero-disk footprint** threat intelligence pipeline that parses the massive (~120 GB) NIST NSRL Modern database entirely in-memory. It generates daily micro-sized native binary hash feeds (CVT1 format) for high-performance engines, alongside **DFIR-compatible plain-text lists** (for Magnet AXIOM, FTK, etc.), deploying them directly to GitHub Releases.
-
----
-
 ## 🧠 The Engineering Problem & Architecture
 
 ### The Constraint
