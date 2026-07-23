@@ -1,59 +1,41 @@
-# ⚡ NIST NSRL Live CVT1 Feed Pipeline
+# ⚡ NIST NSRL Live CVT1 & DFIR Hash Feed Pipeline
 
-
-An automated, high-performance, **zero-disk footprint** threat intelligence pipeline that parses the massive (\~120 GB) NIST NSRL Modern database entirely in-memory, generates daily micro-sized native binary hash feeds (CVT1 format), and deploys them directly to GitHub Releases.
-
-
+An automated, high-performance, **zero-disk footprint** threat intelligence pipeline that parses the massive (~120 GB) NIST NSRL Modern database entirely in-memory. It generates daily micro-sized native binary hash feeds (CVT1 format) for high-performance engines, alongside **DFIR-compatible plain-text lists** (for Magnet AXIOM, FTK, etc.), deploying them directly to GitHub Releases.
 
 ---
 
-
-
-## 🧠 The Engineering Problem \& Architecture
-
-
+## 🧠 The Engineering Problem & Architecture
 
 ### The Constraint
+The official NIST NSRL Modern SQLite database is a massive **~120 GB** monolith. Standard implementations require downloading the entire archive, extracting it to disk, and running heavy SQL queries. Doing this on cloud infrastructure or free-tier automation layers like GitHub Actions is impossible due to the strict **14 GB disk space limit** and performance bottlenecks.
 
-The official NIST NSRL Modern SQLite database is a massive **\~120 GB** monolith. Standard implementations require downloading the entire archive, extracting it to disk, and running heavy SQL queries. Doing this on cloud infrastructure or free-tier automation layers like GitHub Actions is impossible due to the strict **14 GB disk space limit** and performance bottlenecks.
-
-
-
-### The Solution: SQLite Page Carving \& Ring Buffer
-
+### The Solution: SQLite Page Carving, Ring Buffers & Compatibility Layers
 This project completely bypasses the local storage layer and the SQLite engine itself:
 
-1\. **Network Stream to Inflation:** The remote `.zip` file is streamed via HTTP chunks and decompressed (inflated) on the fly.
-
-2\. **Circular Ring Buffer:** Decompressed raw binary `.db` bytes are pushed into a highly optimized, custom multi-threaded **Circular Ring Buffer** (`ByteRing` class).
-
-3\. **Low-Level Page Carving:** Instead of initializing a traditional SQLite database connection (which demands random-access `seek` operations across the entire 120 GB file structure), a custom **Binary Carver** sequentially scans the byte stream in file order. It parses the physical SQLite page/cell boundaries on the fly, extracts valid `MD5`, `SHA-1`, and `SHA-256` columns, and drops everything else.
-
-4\. **Zero-Overhead Binary Packs (CVT1):** Extracted hashes are strictly packed as raw binary streams (16 bytes for MD5, 20 bytes for SHA-1, 32 bytes for SHA-256) instead of bulky ASCII text hex strings.
-
-
+1. **Dynamic Upstream Resolution:** The pipeline dynamically scrapes NIST directories to always target the latest `RDS_*_modern.zip` release without manual URL pinning.
+2. **Network Stream to Inflation:** The remote `.zip` file is streamed via HTTP chunks and decompressed (inflated) on the fly.
+3. **Circular Ring Buffer:** Decompressed raw binary `.db` bytes are pushed into a highly optimized, custom multi-threaded **Circular Ring Buffer** (`ByteRing` class).
+4. **Low-Level Page Carving:** Instead of initializing a traditional SQLite database connection, a custom **Binary Carver** sequentially scans the byte stream in file order. It parses the physical SQLite page/cell boundaries on the fly, extracting valid `MD5`, `SHA-1`, and `SHA-256` columns.
+5. **Zero-Overhead Binary Packs (CVT1):** Extracted hashes are strictly packed as raw binary streams (16 bytes for MD5, 20 bytes for SHA-1, 32 bytes for SHA-256) instead of bulky ASCII text hex strings.
+6. **DFIR Compatibility Layer:** A lightweight secondary pipeline automatically strips the CVT1 headers and exports standard ASCII Hex text files (one hash per line) for traditional forensics tools.
 
 ---
-
 
 
 ## 📊 Live Feed Statistics
 
+Thanks to the elimination of SQLite B-Tree metadata fragmentation and index headers, the massive database overhead collapses into tightly packed files available in two flavors:
 
-
-Thanks to the elimination of SQLite B-Tree metadata fragmentation, index headers, and raw text representations, the massive database overhead collapses into tightly packed high-performance files:
-
-
-
-| Artifact Name | Native Format | Element Size | Total Packed Size | Target Population |
+| Artifact Name | Format | Element Size | Total Packed Size | Target Population |
 | :--- | :--- | :--- | :--- | :--- |
 | 📦 `clean_md5.bin` | Raw Binary | 16 Bytes | ~10.2 MB | ~668,000 Hashes |
 | 📦 `clean_sha1.bin` | Raw Binary | 20 Bytes | ~12.7 MB | ~665,000 Hashes |
 | 📦 `clean_sha256.bin` | Raw Binary | 32 Bytes | ~20.4 MB | ~668,000 Hashes |
+| 📄 `clean_md5.txt` | ASCII Hex | 32 Chars + \n | ~22.0 MB | ~668,000 Hashes |
+| 📄 `clean_sha1.txt` | ASCII Hex | 40 Chars + \n | ~27.0 MB | ~665,000 Hashes |
+| 📄 `clean_sha256.txt` | ASCII Hex | 64 Chars + \n | ~43.0 MB | ~668,000 Hashes |
 
-
-
-*Feeds are completely refreshed and re-generated every 24 hours via automated pipelines.*
+> *Feeds are completely refreshed and re-generated every 24 hours via automated pipelines.*
 
 
 
@@ -69,11 +51,13 @@ Because the feeds are deployed as pure, un-padded binary structures, you don't n
 
 
 
+## 🚀 Integration Guide: How to Use the Feeds
 
-### 1. Integration in C/C++ (Zero-Copy Memory Mapping)
+### 1. DFIR Tools & Standard Software (Magnet AXIOM, FTK, SIEMs)
+Simply download the `.txt` artifacts from the latest Release. These are standard, pre-cleaned, line-separated ASCII hex lists. You can ingest them directly into Magnet AXIOM, Autopsy, FTK, or any SIEM/Sandbox environment for instant whitelisting.
 
-You can directly map the `.bin` files into memory using `mmap` for instant, zero-allocation runtime space lookups:
-
+### 2. Integration in C/C++ (Zero-Copy Memory Mapping)
+For custom engines, you can directly map the native `.bin` files into memory using `mmap` for instant, zero-allocation runtime space lookups:
 
 
 ```cpp
@@ -199,10 +183,15 @@ You can run the exact pipeline logic on your local machine without downloading t
 ### Prerequisites
 pip install requests
 
-### Run the Carver Stream
-python tools/stream\_http\_hash\_filter.py "TARGET\_NIST\_ZIP\_URL" --mode carve --ring-mb 512
+### Run the Carver Stream & Compatibility Layer
 
-Note: Memory allocations will safely hover around your --ring-mb value while processing 100+ GB over the network pipeline.
+# 1. Fetch latest NIST zip, extract hashes in-memory, and pack to CVT1 binaries
+python tools/stream_http_hash_filter.py --latest-modern -o clean_packs
+
+# 2. Export CVT1 binaries to DFIR-compatible plain-text lists
+python tools/cvt1_to_text.py -i clean_packs -o clean_packs
+
+Note: Memory allocations will safely hover around the default --ring-mb 512 value while processing 120+ GB over the network pipeline.
 
 ## 🛡️ Maintainer \& Author
 Cemil Emre Bıyık - Computer Systems \& Low-Level Security Architecture Enthusiast.
