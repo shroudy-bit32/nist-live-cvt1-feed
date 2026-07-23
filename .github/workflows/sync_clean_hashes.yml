@@ -32,22 +32,29 @@ jobs:
 
       - name: Execute In-Memory Stream Parser
         run: |
-          # Streams remote hash list into native CVT1 packs under ./clean_packs
-          python tools/stream_http_hash_filter.py \
-            "https://s3.amazonaws.com/rds.nsrl.nist.gov/RDS/rds_2026.03.1/RDS_2026.03.1_modern.zip" \
-            -o clean_packs
+          # Auto-discovers newest full RDS_*_modern.zip (skips minimal/delta),
+          # then streams it into native CVT1 packs under ./clean_packs
+          python tools/stream_http_hash_filter.py --latest-modern -o clean_packs
+
+      - name: Export DFIR-Compatible Text Hash Lists
+        run: |
+          # CVT1 .bin → one-hex-digest-per-line .txt (Magnet AXIOM / FTK / etc.)
+          python tools/cvt1_to_text.py -i clean_packs -o clean_packs
 
       - name: Deploy Native CVT1 Binary Feed to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest-feed
           name: "Latest Clean Hash Feed (CVT1 Packs)"
-          body: "Automated 24h zero-footprint binary hash feed generation for the core scanning engine."
+          body: "Automated 24h zero-footprint binary hash feed generation for the core scanning engine. Includes DFIR-compatible plain-text hash lists for Magnet AXIOM / FTK."
           make_latest: true
           files: |
             clean_packs/clean_md5.bin
             clean_packs/clean_sha1.bin
             clean_packs/clean_sha256.bin
+            clean_packs/clean_md5.txt
+            clean_packs/clean_sha1.txt
+            clean_packs/clean_sha256.txt
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
