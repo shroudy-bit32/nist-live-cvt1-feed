@@ -85,58 +85,41 @@ int main() {
 }
 ```
 
-### 2. Integration in Python (Struct Unpacking)
+### 3. Integration in Python (Struct Unpacking)
 If you want to read or query the generated binary files using Python, you can unpack the CVT1 headers like this:
 ```
 import struct
-
 from pathlib import Path
 
-
-
-def parse\_cvt1\_pack(bin\_path: str):
-
-&#x20;   path = Path(bin\_path)
-
-&#x20;   if not path.exists():
-
-&#x20;       return \[]
-
-&#x20;   data = path.read\_bytes()
-
-&#x20;   header\_format = "<IIIQI"
-
-&#x20;   header\_size = struct.calcsize(header\_format)
-
-&#x20;   if len(data) < header\_size:
-
-&#x20;       return \[]
-
-&#x20;   magic, version, algo, timestamp, count = struct.unpack\_from(header\_format, data, 0)
-
-&#x20;   algo\_sizes = {1: 16, 2: 20, 3: 32}
-
-&#x20;   if algo not in algo\_sizes:
-
-&#x20;       return \[]
-
-&#x20;   hash\_size = algo\_sizes\[algo]
-
-&#x20;   hashes = \[]
-
-&#x20;   offset = header\_size
-
-&#x20;   for \_ in range(count):
-
-&#x20;       if offset + hash\_size > len(data):
-
-&#x20;           break
-
-&#x20;       hashes.append(data\[offset : offset + hash\_size].hex())
-
-&#x20;       offset += hash\_size
-
-&#x20;   return hashes
+def parse_cvt1_pack(bin_path: str):
+    path = Path(bin_path)
+    if not path.exists():
+        return []
+        
+    data = path.read_bytes()
+    header_format = "<IIIQI"
+    header_size = struct.calcsize(header_format)
+    
+    if len(data) < header_size:
+        return []
+        
+    magic, version, algo, timestamp, count = struct.unpack_from(header_format, data, 0)
+    algo_sizes = {1: 16, 2: 20, 3: 32}
+    
+    if algo not in algo_sizes:
+        return []
+        
+    hash_size = algo_sizes[algo]
+    hashes = []
+    offset = header_size
+    
+    for _ in range(count):
+        if offset + hash_size > len(data):
+            break
+        hashes.append(data[offset : offset + hash_size].hex())
+        offset += hash_size
+        
+    return hashes
 ```
 
 ## 🛠️ Running the Infrastructure Locally
