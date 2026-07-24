@@ -10,9 +10,17 @@ on:
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: latest-feed
+
 jobs:
-  build-and-sync:
+  # -------------------------------------------------------------------------
+  # 1) Full NIST modern carve → CVT1 .bin packs only (heavy job)
+  # -------------------------------------------------------------------------
+  build-bins:
     runs-on: ubuntu-latest
+    # Full modern.zip stream + carve can take several hours on free runners.
+    timeout-minutes: 360
     permissions:
       contents: write
 
@@ -30,31 +38,80 @@ jobs:
           python -m pip install --upgrade pip
           pip install requests
 
-      - name: Execute In-Memory Stream Parser
+      - name: Execute Full-Scan Stream Parser
         run: |
-          # Auto-discovers newest full RDS_*_modern.zip (skips minimal/delta),
-          # then streams it into native CVT1 packs under ./clean_packs
+          # Auto-discovers newest full RDS_*_modern.zip (skips minimal/delta).
+          # Exact online unique → CVT1 .bin under ./clean_packs
           python tools/stream_http_hash_filter.py --latest-modern -o clean_packs
 
-      - name: Export DFIR-Compatible Text Hash Lists
-        run: |
-          # CVT1 .bin → one-hex-digest-per-line .txt (Magnet AXIOM / FTK / etc.)
-          python tools/cvt1_to_text.py -i clean_packs -o clean_packs
-
-      - name: Deploy Native CVT1 Binary Feed to GitHub Releases
+      - name: Deploy CVT1 Binary Packs to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-feed
+          tag_name: ${{ env.RELEASE_TAG }}
           name: "Latest Clean Hash Feed (CVT1 Packs)"
-          body: "Automated 24h zero-footprint binary hash feed generation for the core scanning engine. Includes DFIR-compatible plain-text hash lists for Magnet AXIOM / FTK."
+          body: |
+            Automated zero-footprint binary hash feed (CVT1).
+
+            - `.bin` packs are produced by the full modern RDS carve job.
+            - DFIR `.txt` lists (Magnet AXIOM / FTK) are attached by follow-up
+              jobs that convert one algorithm at a time from these binaries
+              (keeps free-runner disk under the limit).
           make_latest: true
           files: |
             clean_packs/clean_md5.bin
             clean_packs/clean_sha1.bin
             clean_packs/clean_sha256.bin
-            clean_packs/clean_md5.txt
-            clean_packs/clean_sha1.txt
-            clean_packs/clean_sha256.txt
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # -------------------------------------------------------------------------
+  # 2) Per-algo DFIR text export (light jobs; one .bin + one .txt on disk)
+  # -------------------------------------------------------------------------
+  export-txt:
+    name: Export ${{ matrix.pack }}.txt
+    needs: build-bins
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        pack:
+          - clean_sha256
+          - clean_sha1
+          - clean_md5
+
+    steps:
+      - name: Checkout Monorepo Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download ${{ matrix.pack }}.bin from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p clean_packs
+          gh release download "${{ env.RELEASE_TAG }}" \
+            --pattern "${{ matrix.pack }}.bin" \
+            --dir clean_packs \
+            --clobber
+
+      - name: Convert ${{ matrix.pack }}.bin → .txt
+        run: |
+          # Single-pack convert keeps peak disk ≈ one bin + one txt
+          python tools/cvt1_to_text.py -i clean_packs -o clean_packs \
+            "${{ matrix.pack }}.bin"
+
+      - name: Attach ${{ matrix.pack }}.txt to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ env.RELEASE_TAG }}" \
+            "clean_packs/${{ matrix.pack }}.txt" \
+            --clobber
