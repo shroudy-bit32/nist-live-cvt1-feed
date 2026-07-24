@@ -141,6 +141,18 @@ jobs:
   #
   # External k-way merge over already-sorted parts (merge_sorted_raw_runs) --
   # not an in-memory set -- so this stays cheap regardless of total hash count.
+  #
+  # GitHub caps a single release asset at 2 GiB, and clean_sha256.bin cleared
+  # that in the first real run (~67M+ unique digests). Raw hash digests are
+  # ~incompressible (measured: gzip -9 / zip -9 both land at ~100% of
+  # original size), so compression can't rescue an oversized .bin -- only
+  # splitting can. tools/pack_release_assets.py splits any .bin over
+  # 1.5 GiB into clean_<algo>_partNN.bin pieces (part 1 carries the original
+  # CVT1 header verbatim, so `cat` alone reconstructs a byte-exact copy --
+  # see the script docstring), verifies every piece is actually under the
+  # limit, and deletes the raw unsplit .bin the moment that's confirmed.
+  # No compression is applied to .bin -- it wouldn't shrink it, and would
+  # only add a decompression step for no benefit.
   # -------------------------------------------------------------------------
   merge-parts:
     needs: carve-and-chunk
@@ -170,6 +182,12 @@ jobs:
       - name: Merge parts -> clean_*.bin
         run: |
           python tools/merge_cvt1_parts.py -i chunks_dl -o clean_packs
+          rm -rf chunks_dl
+
+      - name: Split any .bin over 1.5 GiB (deletes the raw unsplit file)
+        run: |
+          python tools/pack_release_assets.py --dir clean_packs --limit-mib 1500
+          ls -la clean_packs/
 
       - name: Deploy CVT1 Binary Packs to GitHub Releases
         uses: softprops/action-gh-release@v2
@@ -177,19 +195,12 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           name: "Latest Clean Hash Feed (CVT1 Packs)"
           body: |
-            Automated zero-footprint binary hash feed (CVT1).
-
-            - `.bin` packs are produced by merging the scatter-gather chunk
-              parts from the full modern RDS carve job (one exact-unique
-              k-way merge across all parts, no in-memory set).
-            - DFIR `.txt` lists (Magnet AXIOM / FTK) are attached by follow-up
-              jobs that convert one algorithm at a time from these binaries
-              (keeps free-runner disk under the limit).
+            Release in progress: `.bin` packs are up, DFIR `.txt` lists and
+            the full per-algorithm notes (with merge commands for any
+            multi-part file) are published once the export-txt jobs finish.
           make_latest: true
           files: |
-            clean_packs/clean_md5.bin
-            clean_packs/clean_sha1.bin
-            clean_packs/clean_sha256.bin
+            clean_packs/*.bin
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -204,6 +215,16 @@ jobs:
 
   # -------------------------------------------------------------------------
   # 3) Per-algo DFIR text export (light jobs; one .bin + one .txt on disk)
+  #
+  # merge-parts publishes RAW .bin (possibly split into _partNN pieces). This
+  # job downloads whichever piece(s) exist for its algo and reconstructs the
+  # full .bin with the EXACT SAME `cat` command published in the release
+  # notes tutorial (self-testing: if that command were ever wrong, this job
+  # would fail too), converts once with the existing cvt1_to_text.py, then
+  # splits the resulting .txt the same way if it's still over the limit --
+  # no compression anywhere in this pipeline: raw digests don't compress
+  # (measured ~100% of original size) and splitting alone already solves the
+  # 2 GiB limit for every file type, so there's no reason to also gzip/zip.
   # -------------------------------------------------------------------------
   export-txt:
     name: Export ${{ matrix.pack }}.txt
@@ -229,26 +250,70 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Download ${{ matrix.pack }}.bin from release
+      - name: Download ${{ matrix.pack }} .bin part(s) from release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p clean_packs
           gh release download "${{ env.RELEASE_TAG }}" \
-            --pattern "${{ matrix.pack }}.bin" \
+            --pattern "${{ matrix.pack }}*.bin" \
             --dir clean_packs \
             --clobber
 
-      - name: Convert ${{ matrix.pack }}.bin → .txt
+      - name: Reconstruct full .bin and convert to .txt
         run: |
-          # Single-pack convert keeps peak disk ≈ one bin + one txt
-          python tools/cvt1_to_text.py -i clean_packs -o clean_packs \
-            "${{ matrix.pack }}.bin"
+          set -e
+          cd clean_packs
+          parts=$(ls ${{ matrix.pack }}*.bin | sort)
+          cat $parts > "${{ matrix.pack }}_full.bin"
+          rm -f $parts
+          python ../tools/cvt1_to_text.py -i . -o . "${{ matrix.pack }}_full.bin"
+          mv "${{ matrix.pack }}_full.txt" "${{ matrix.pack }}.txt"
+          rm -f "${{ matrix.pack }}_full.bin"
+          wc -l "${{ matrix.pack }}.txt"
 
-      - name: Attach ${{ matrix.pack }}.txt to release
+      - name: Split ${{ matrix.pack }}.txt if over 1.5 GiB (deletes the raw unsplit file)
+        run: |
+          python tools/pack_release_assets.py --dir clean_packs \
+            --files "${{ matrix.pack }}.txt" --limit-mib 1500
+          ls -la clean_packs/
+
+      - name: Attach ${{ matrix.pack }} .txt part(s) to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ env.RELEASE_TAG }}" \
-            "clean_packs/${{ matrix.pack }}.txt" \
+            clean_packs/${{ matrix.pack }}*.txt \
             --clobber
+
+  # -------------------------------------------------------------------------
+  # 4) Publish comprehensive release notes -- runs only after every .bin AND
+  # every .txt archive is actually on the release, so the table of contents,
+  # per-algorithm sizes, and merge commands describe ground truth (the real
+  # asset list + a live Range-read of each algorithm's true digest count),
+  # never an assumption about how many parts a given run produced.
+  # -------------------------------------------------------------------------
+  publish-release-notes:
+    name: Publish release notes
+    needs: export-txt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Monorepo Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Render and publish release notes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python tools/render_release_notes.py \
+            --tag "${{ env.RELEASE_TAG }}" \
+            --repo "${{ github.repository }}"
