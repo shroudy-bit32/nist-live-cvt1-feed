@@ -1,0 +1,11 @@
+build/
+dist/
+*.egg-info/
+.cmake/
+_skbuild/
+**/__pycache__/
+*.pyc
+.venv/
+venv/
+clean_packs/
+*.raw

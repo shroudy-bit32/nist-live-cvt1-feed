@@ -21,16 +21,31 @@ Why not sqlite3.connect on the ring?
 Ring size default is 512 MiB (safe on ~7 GiB GHA runners). Use --ring-mb
 10240 only on a machine that actually has that RAM.
 
+Full-scan path (default for zip carve, --max-keep 0)
+----------------------------------------------------
+Native C++ engine via pybind11 (`cvt_carve`), no hash caps:
+
+  Ping-pong arenas (zero-copy page walk) ∥ inflate fill
+  → hardware_concurrency workers, thread-local 256 L1 buckets
+  → window sort/unique flush to disk shards
+  → final per-shard sort/unique → CVT1 .bin
+
+Set CVT_FORCE_PYTHON=1 only for the slower Python spill-merge fallback.
+
 Also supports: gzip/text feeds; optional --mode sqlite-disk (temp .db + SQL).
 """
 
 from __future__ import annotations
 
 import argparse
+import heapq
 import os
 import re
+import shlex
+import shutil
 import sqlite3
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
@@ -50,6 +65,21 @@ CVT1_VERSION = 1
 ALGO_MD5 = 1
 ALGO_SHA1 = 2
 ALGO_SHA256 = 3
+DIGEST_SIZE_BY_ALGO: Dict[int, int] = {
+    ALGO_MD5: 16,
+    ALGO_SHA1: 20,
+    ALGO_SHA256: 32,
+}
+ALGO_BY_DIGEST_SIZE: Dict[int, int] = {
+    16: ALGO_MD5,
+    20: ALGO_SHA1,
+    32: ALGO_SHA256,
+}
+PACK_NAME_BY_ALGO: Dict[int, str] = {
+    ALGO_MD5: "clean_md5.bin",
+    ALGO_SHA1: "clean_sha1.bin",
+    ALGO_SHA256: "clean_sha256.bin",
+}
 
 ZIP_LOCAL_SIG = b"PK\x03\x04"
 ZIP_CENTRAL_SIG = b"PK\x01\x02"
@@ -291,6 +321,318 @@ class ByteRing:
 
 
 # ---------------------------------------------------------------------------
+# Digest sinks: in-memory (capped) or external unique (full scan)
+# ---------------------------------------------------------------------------
+
+DEFAULT_UNIQUE_MEMORY_ITEMS = 4_000_000
+
+# Native ShardSink partitions by first hash byte -- must match kShards in
+# native/include/cvt/shard_sink.hpp.
+NATIVE_SHARD_COUNT = 256
+# (16 + 20 + 32) / 3, rounded up: average raw digest size across the three
+# algos, used only to size the worst-case RAM estimate below.
+AVG_DIGEST_BYTES = 23
+DEFAULT_BUCKET_RAM_BUDGET_MB = 2048
+MIN_BUCKET_CAP = 2_000
+MAX_BUCKET_CAP = 50_000
+
+
+def compute_dynamic_bucket_cap(workers: int, ram_budget_mb: int) -> int:
+    """
+    Size the native engine's per-thread, per-shard TLS bucket capacity from
+    an actual RAM budget instead of a flat constant.
+
+    Worst case is the *normal* case here, not a rare edge: hash first-bytes
+    are uniformly distributed, so all kShards buckets on a given thread fill
+    at roughly the same rate and approach bucket_cap together. Peak resident
+    RAM for buckets alone is therefore approximately:
+
+        workers * NATIVE_SHARD_COUNT * bucket_cap * AVG_DIGEST_BYTES
+
+    Solve for bucket_cap given a target ceiling instead of hoping a flat
+    50,000 happens to fit whatever hardware_concurrency() returns.
+    """
+    workers = max(1, workers)
+    budget_bytes = max(1, ram_budget_mb) * 1024 * 1024
+    raw = budget_bytes // (workers * NATIVE_SHARD_COUNT * AVG_DIGEST_BYTES)
+    return max(MIN_BUCKET_CAP, min(MAX_BUCKET_CAP, int(raw)))
+
+
+class MemoryDigestSink:
+    """In-RAM unique digests. Optional max_keep > 0 stops the carve early."""
+
+    def __init__(self, max_keep: int = 0) -> None:
+        self.accepted: Set[str] = set()
+        self.max_keep = max_keep  # 0 = unlimited
+
+    def offer_hex(self, h: str) -> bool:
+        if self.max_keep and len(self.accepted) >= self.max_keep:
+            return False
+        self.accepted.add(h)
+        if self.max_keep and len(self.accepted) >= self.max_keep:
+            return False
+        return True
+
+    def offer_raw(self, raw: bytes) -> bool:
+        n = len(raw)
+        if n not in (16, 20, 32):
+            return True
+        return self.offer_hex(raw.hex())
+
+    @property
+    def stopped(self) -> bool:
+        return bool(self.max_keep and len(self.accepted) >= self.max_keep)
+
+
+class ExternalUniqueSink:
+    """
+    Exact online unique for full NSRL carve (no false drops).
+
+    Flow:
+      offer → per-algo in-memory set (drops dups in the current window)
+           → when memory_items is hit, spill each non-empty set as a sorted
+             unique run file
+           → close() spills remainder
+           → merge_sorted_raw_runs() k-way merges runs with exact unique
+
+    Peak disk ≈ unique digest payload (+ brief merge output), not ~940M rows.
+    """
+
+    def __init__(
+        self,
+        directory: Path,
+        memory_items: int = DEFAULT_UNIQUE_MEMORY_ITEMS,
+    ) -> None:
+        if memory_items < 10_000:
+            raise ValueError("memory_items must be >= 10000")
+        self.directory = directory
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.memory_items = memory_items
+        self.sets: Dict[int, Set[bytes]] = {16: set(), 20: set(), 32: set()}
+        self.runs: Dict[int, List[Path]] = {16: [], 20: [], 32: []}
+        self.offered: int = 0
+        self.duplicates_dropped: int = 0
+        self.unique_accepted: int = 0  # first-seen into memory (pre-cross-run dups)
+        self.spilled_records: int = 0
+        self._run_seq = 0
+        self._closed = False
+
+    def _mem_count(self) -> int:
+        return sum(len(s) for s in self.sets.values())
+
+    def offer_raw(self, raw: bytes) -> bool:
+        if self._closed:
+            raise RuntimeError("ExternalUniqueSink is closed")
+        n = len(raw)
+        bucket = self.sets.get(n)
+        if bucket is None:
+            return True
+        self.offered += 1
+        if raw in bucket:
+            self.duplicates_dropped += 1
+            return True
+        bucket.add(raw)
+        self.unique_accepted += 1
+        if self._mem_count() >= self.memory_items:
+            self._spill_all()
+        return True
+
+    def offer_hex(self, h: str) -> bool:
+        if not looks_like_digest(h):
+            return True
+        return self.offer_raw(bytes.fromhex(h))
+
+    @property
+    def stopped(self) -> bool:
+        return False
+
+    def _spill_size(self, size: int) -> None:
+        bucket = self.sets[size]
+        if not bucket:
+            return
+        path = self.directory / f"run_{size}_{self._run_seq:04d}.raw"
+        self._run_seq += 1
+        with path.open("wb") as fh:
+            for dig in sorted(bucket):
+                fh.write(dig)
+        n = len(bucket)
+        self.spilled_records += n
+        self.runs[size].append(path)
+        bucket.clear()
+        print(
+            f"    [unique] spill size={size} records={n} "
+            f"runs={len(self.runs[size])} offered={self.offered} "
+            f"dropped_dup={self.duplicates_dropped}",
+            file=sys.stderr,
+        )
+
+    def _spill_all(self) -> None:
+        for size in (16, 20, 32):
+            self._spill_size(size)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._spill_all()
+        self._closed = True
+
+    def __enter__(self) -> "ExternalUniqueSink":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    def stats_line(self) -> str:
+        return (
+            f"offered={self.offered} mem_unique={self._mem_count()} "
+            f"accepted={self.unique_accepted} dropped_dup={self.duplicates_dropped} "
+            f"runs={sum(len(v) for v in self.runs.values())}"
+        )
+
+
+def merge_sorted_raw_runs(
+    runs: List[Path], digest_size: int, dst: Path
+) -> int:
+    """K-way merge of sorted unique runs → sorted exact-unique raw file."""
+    if not runs:
+        dst.write_bytes(b"")
+        return 0
+
+    if len(runs) == 1:
+        src = runs[0]
+        if src.resolve() != dst.resolve():
+            shutil.copyfile(src, dst)
+            src.unlink(missing_ok=True)
+        nbytes = dst.stat().st_size
+        if nbytes % digest_size:
+            raise RuntimeError(f"{dst}: bad size {nbytes}")
+        return nbytes // digest_size
+
+    handles = [p.open("rb") for p in runs]
+    try:
+        heap: List[Tuple[bytes, int]] = []
+        for idx, fh in enumerate(handles):
+            dig = fh.read(digest_size)
+            if not dig:
+                continue
+            if len(dig) != digest_size:
+                raise RuntimeError(f"{runs[idx]}: truncated digest")
+            heapq.heappush(heap, (dig, idx))
+
+        count = 0
+        last: Optional[bytes] = None
+        with dst.open("wb") as out:
+            while heap:
+                dig, idx = heapq.heappop(heap)
+                if dig != last:
+                    out.write(dig)
+                    last = dig
+                    count += 1
+                nxt = handles[idx].read(digest_size)
+                if not nxt:
+                    continue
+                if len(nxt) != digest_size:
+                    raise RuntimeError(f"{runs[idx]}: truncated digest")
+                heapq.heappush(heap, (nxt, idx))
+        return count
+    finally:
+        for fh in handles:
+            fh.close()
+        for p in runs:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def write_cvt1_from_raw(
+    raw_path: Path, out_path: Path, algo: int, updated_unix: int
+) -> int:
+    digest_size = DIGEST_SIZE_BY_ALGO[algo]
+    nbytes = raw_path.stat().st_size if raw_path.is_file() else 0
+    if nbytes % digest_size:
+        raise RuntimeError(f"{raw_path}: bad raw size {nbytes}")
+    count = nbytes // digest_size
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    header = struct.pack(
+        "<IIIQI", CVT1_MAGIC, CVT1_VERSION, algo, updated_unix, count
+    )
+    with out_path.open("wb") as out, raw_path.open("rb") as src:
+        out.write(header)
+        while True:
+            block = src.read(1024 * 1024)
+            if not block:
+                break
+            out.write(block)
+    return count
+
+
+def _write_raw_as_text(raw_path: Path, txt_path: Path, digest_size: int) -> None:
+    with raw_path.open("rb") as src, txt_path.open(
+        "w", encoding="ascii", newline="\n"
+    ) as out:
+        while True:
+            block = src.read(digest_size * 8192)
+            if not block:
+                break
+            if len(block) % digest_size:
+                raise RuntimeError(f"{raw_path}: truncated while writing text")
+            for i in range(0, len(block), digest_size):
+                out.write(block[i : i + digest_size].hex())
+                out.write("\n")
+
+
+def finalize_external_unique_to_packs(
+    sink: ExternalUniqueSink,
+    out_dir: Path,
+    *,
+    updated_unix: Optional[int] = None,
+    text: bool = False,
+) -> Dict[str, int]:
+    """Merge spilled runs to exact-unique raw → CVT1 .bin (+ optional .txt)."""
+    sink.close()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts = int(updated_unix if updated_unix is not None else time.time())
+    counts: Dict[str, int] = {}
+    print(
+        f"    [unique] finalize {sink.stats_line()}",
+        file=sys.stderr,
+    )
+    for size in (16, 20, 32):
+        algo = ALGO_BY_DIGEST_SIZE[size]
+        pack_name = PACK_NAME_BY_ALGO[algo]
+        unique_raw = sink.directory / f"unique_{size}.raw"
+        runs = list(sink.runs[size])
+        print(
+            f"    [unique] merge size={size} runs={len(runs)} → {pack_name}",
+            file=sys.stderr,
+        )
+        n = merge_sorted_raw_runs(runs, size, unique_raw)
+        sink.runs[size] = []
+        if text:
+            txt_path = out_dir / pack_name.replace(".bin", ".txt")
+            _write_raw_as_text(unique_raw, txt_path, size)
+            counts[txt_path.name] = n
+        bin_path = out_dir / pack_name
+        write_cvt1_from_raw(unique_raw, bin_path, algo, ts)
+        counts[pack_name] = n
+        try:
+            unique_raw.unlink(missing_ok=True)
+        except OSError:
+            pass
+        print(f"    [unique] {pack_name}: {n} exact unique", file=sys.stderr)
+    drop_pct = (
+        (100.0 * sink.duplicates_dropped / sink.offered) if sink.offered else 0.0
+    )
+    print(
+        f"    [unique] done offered={sink.offered} "
+        f"dropped_dup={sink.duplicates_dropped} ({drop_pct:.1f}%)",
+        file=sys.stderr,
+    )
+    return counts
+
+
+# ---------------------------------------------------------------------------
 # SQLite sequential page carve (file-order read, like scanning a local .db)
 # ---------------------------------------------------------------------------
 
@@ -338,8 +680,29 @@ def _serial_type_len(serial: int) -> Tuple[str, int]:
     return "reserved", 0
 
 
-def _digests_from_record_payload(payload: bytes, into: Set[str], max_keep: int) -> None:
-    if len(into) >= max_keep or not payload:
+def _is_metadata_row_tail(serials: List[int]) -> bool:
+    """
+    NSRL RDSv3 modern.db METADATA row fingerprint (verified against the live
+    schema.sql: ..., crc32, md5, sha1, sha256 -- the last four columns, all
+    declared NOT NULL). Only accept a record whose LAST FOUR serial types are
+    exactly text(8)/text(32)/text(40)/text(64) in that order.
+
+    This is a positional match, not a length-only match: METADATA also has
+    key_hash/image_hash columns earlier in the same row that can coincidentally
+    look like hex hashes, and path/file_name can contain hash-looking
+    substrings (content-addressable cache filenames etc.) -- neither can ever
+    land in this exact trailing slot, so this rejects both without needing the
+    table name (which a bare leaf page can't tell you anyway).
+    """
+    if len(serials) < 4:
+        return False
+    kinds_lens = [_serial_type_len(s) for s in serials[-4:]]
+    expected = [("text", 8), ("text", 32), ("text", 40), ("text", 64)]
+    return kinds_lens == expected
+
+
+def _digests_from_record_payload(payload: bytes, sink: object) -> None:
+    if not payload or getattr(sink, "stopped", False):
         return
     try:
         header_size, i = _read_varint(payload, 0)
@@ -355,42 +718,31 @@ def _digests_from_record_payload(payload: bytes, into: Set[str], max_keep: int) 
         except ValueError:
             return
         serials.append(s)
+    if not _is_metadata_row_tail(serials):
+        return
+
     body = payload[header_end:]
     off = 0
-    for s in serials:
+    offer_hex = sink.offer_hex  # type: ignore[attr-defined]
+    n = len(serials)
+    for idx, s in enumerate(serials):
         kind, ln = _serial_type_len(s)
         if off + ln > len(body):
-            return
+            return  # overflow-truncated locally; don't guess
         chunk = body[off : off + ln]
         off += ln
-        if kind == "text" and ln in (32, 40, 64):
-            try:
-                t = chunk.decode("ascii", errors="strict").strip().lower()
-            except UnicodeError:
-                continue
-            if looks_like_digest(t):
-                into.add(t)
-                if len(into) >= max_keep:
-                    return
-        elif kind == "blob" and ln in (16, 20, 32):
-            into.add(chunk.hex())
-            if len(into) >= max_keep:
-                return
-        elif kind == "text" and 32 <= ln <= 80:
-            # quoted / prefixed forms inside longer text cells
-            try:
-                t = chunk.decode("utf-8", errors="ignore").strip().lower()
-            except Exception:
-                continue
-            m = re.search(r"\b([0-9a-f]{64}|[0-9a-f]{40}|[0-9a-f]{32})\b", t)
-            if m and looks_like_digest(m.group(1)):
-                into.add(m.group(1))
-                if len(into) >= max_keep:
-                    return
+        if idx < n - 3:
+            continue  # md5, sha1, sha256 only -- crc32 (n-4) unused
+        try:
+            t = chunk.decode("ascii", errors="strict").strip().lower()
+        except UnicodeError:
+            continue
+        if looks_like_digest(t) and not offer_hex(t):
+            return
 
 
-def _carve_leaf_table_page(page: bytes, into: Set[str], max_keep: int, page1_hdr: bool) -> None:
-    if len(into) >= max_keep:
+def _carve_leaf_table_page(page: bytes, sink: object, page1_hdr: bool) -> None:
+    if getattr(sink, "stopped", False):
         return
     base = 100 if page1_hdr else 0
     if len(page) <= base + 8:
@@ -403,7 +755,7 @@ def _carve_leaf_table_page(page: bytes, into: Set[str], max_keep: int, page1_hdr
         return
     ptr_base = base + 8
     for c in range(ncells):
-        if len(into) >= max_keep:
+        if getattr(sink, "stopped", False):
             return
         poff = ptr_base + c * 2
         if poff + 2 > len(page):
@@ -423,20 +775,17 @@ def _carve_leaf_table_page(page: bytes, into: Set[str], max_keep: int, page1_hdr
         else:
             # overflow: take local portion only (short hashes usually fit)
             payload = local
-        _digests_from_record_payload(payload, into, max_keep)
+        _digests_from_record_payload(payload, sink)
 
 
 def carve_sqlite_stream_from_ring(
     ring: ByteRing,
-    *,
-    max_keep: int = 2_000_000,
-) -> Set[str]:
+    sink: object,
+) -> None:
     """
     Read the .db byte stream in file order from the ring and carve hash cells.
-    Equivalent extraction target to scanning a local file sequentially.
+    Digests go to sink (memory set or disk spool).
     """
-    accepted: Set[str] = set()
-
     # Page 1 begins with 100-byte DB header.
     hdr = ring.read(100)
     if len(hdr) < 100 or hdr[0:16] != b"SQLite format 3\x00":
@@ -456,11 +805,11 @@ def carve_sqlite_stream_from_ring(
     if len(rest) < page_size - 100:
         raise RuntimeError("truncated first SQLite page")
     page1 = hdr + rest
-    _carve_leaf_table_page(page1, accepted, max_keep, page1_hdr=True)
+    _carve_leaf_table_page(page1, sink, page1_hdr=True)
 
     pages = 1
     last_report = 0
-    while len(accepted) < max_keep:
+    while not getattr(sink, "stopped", False):
         page = ring.read(page_size)
         if len(page) == 0:
             break
@@ -468,40 +817,83 @@ def carve_sqlite_stream_from_ring(
             # trailing incomplete page — ignore
             break
         pages += 1
-        _carve_leaf_table_page(page, accepted, max_keep, page1_hdr=False)
+        _carve_leaf_table_page(page, sink, page1_hdr=False)
         if pages - last_report >= 50000:
             last_report = pages
+            if isinstance(sink, MemoryDigestSink):
+                detail = f"unique={len(sink.accepted)}"
+            elif isinstance(sink, ExternalUniqueSink):
+                detail = sink.stats_line()
+            else:
+                detail = "digests=?"
             print(
-                f"    [carve] pages={pages} digests={len(accepted)} "
+                f"    [carve] pages={pages} {detail} "
                 f"ring_r={ring.bytes_read / (1024 * 1024):.1f}MiB "
                 f"ring_w={ring.bytes_written / (1024 * 1024):.1f}MiB",
                 file=sys.stderr,
             )
 
-    print(
-        f"    [carve] done pages={pages} unique_digests={len(accepted)}",
-        file=sys.stderr,
-    )
-    return accepted
+    if isinstance(sink, MemoryDigestSink):
+        detail = f"unique={len(sink.accepted)}"
+    elif isinstance(sink, ExternalUniqueSink):
+        detail = sink.stats_line()
+    else:
+        detail = "digests=?"
+    print(f"    [carve] done pages={pages} {detail}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
 # HTTP + ZIP (sequential local-header) — inflate member into ring
 # ---------------------------------------------------------------------------
 
+DEFAULT_HTTP_MAX_RETRIES = 8
+DEFAULT_HTTP_RETRY_BACKOFF_BASE = 2.0
+DEFAULT_HTTP_RETRY_BACKOFF_MAX = 60.0
+
+
 class HttpByteStream:
-    def __init__(self, url: str, chunk_size: int = CHUNK_SIZE, timeout: int = 600) -> None:
+    """
+    Streams an HTTP(S) resource with transparent reconnect-on-drop.
+
+    A multi-hour single GET (the ~123.6 GiB modern.zip) has a real chance of
+    a transient connection reset somewhere in the middle. On any read error,
+    this reopens the connection with a byte-exact `Range: bytes={offset}-`
+    continuation instead of restarting from zero. Crucially the process
+    itself never dies here -- only the TCP connection does -- so whatever
+    zlib.decompressobj is consuming these bytes upstream (in
+    _inflate_zip_entry) keeps its in-memory decoder state the entire time and
+    genuinely continues correctly from exactly where it left off. This is
+    different from (and does not attempt to solve) resuming a fresh process
+    after the whole job has been killed: raw deflate has no serializable
+    decoder state and this stream (verified empirically against the live
+    file -- no Z_SYNC_FLUSH markers anywhere in a 30+ MiB sample) has no
+    usable restart points, so that case genuinely can't be patched around at
+    this layer. See README for why.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        chunk_size: int = CHUNK_SIZE,
+        timeout: int = 600,
+        max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+    ) -> None:
         self.url = url
         self.chunk_size = chunk_size
         self.timeout = timeout
+        self.max_retries = max_retries
         self._buf = bytearray()
         self._eof = False
         self._resp = None
         self._iter = None
         self._use_requests = False
-        self._open()
+        self._raw_offset = 0  # absolute bytes consumed from the resource so far
+        self._open(start=0)
 
-    def _open(self) -> None:
+    def _open(self, start: int) -> None:
+        headers = {"User-Agent": HTTP_USER_AGENT}
+        if start > 0:
+            headers["Range"] = f"bytes={start}-"
         try:
             import requests  # type: ignore
 
@@ -510,14 +902,56 @@ class HttpByteStream:
                 self.url,
                 stream=True,
                 timeout=self.timeout,
-                headers={"User-Agent": HTTP_USER_AGENT},
+                headers=headers,
             )
             self._resp.raise_for_status()
+            if start > 0 and self._resp.status_code != 206:
+                raise RuntimeError(
+                    f"server did not honor Range resume (status={self._resp.status_code}); "
+                    "refusing to silently restart from byte 0 mid-stream"
+                )
             self._iter = self._resp.iter_content(chunk_size=self.chunk_size)
         except ImportError:
-            req = Request(self.url, headers={"User-Agent": HTTP_USER_AGENT})
+            req = Request(self.url, headers=headers)
             self._resp = urlopen(req, timeout=self.timeout)
             self._use_requests = False
+            if start > 0:
+                code = getattr(self._resp, "status", getattr(self._resp, "code", 200))
+                if code != 206:
+                    raise RuntimeError(
+                        f"server did not honor Range resume (status={code}); "
+                        "refusing to silently restart from byte 0 mid-stream"
+                    )
+
+    def _reconnect(self, exc: BaseException) -> None:
+        try:
+            if self._resp is not None:
+                self._resp.close()
+        except Exception:
+            pass
+        for attempt in range(1, self.max_retries + 1):
+            delay = min(
+                DEFAULT_HTTP_RETRY_BACKOFF_MAX,
+                DEFAULT_HTTP_RETRY_BACKOFF_BASE * (2 ** (attempt - 1)),
+            )
+            print(
+                f"    [http] connection error at byte offset {self._raw_offset}: {exc}; "
+                f"reconnect attempt {attempt}/{self.max_retries} in {delay:.0f}s "
+                "(Range resume — no bytes re-downloaded, no data lost)",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+            try:
+                self._open(start=self._raw_offset)
+                print(f"    [http] reconnected at byte offset {self._raw_offset}", file=sys.stderr)
+                return
+            except Exception as exc2:  # noqa: BLE001 - keep retrying on any reopen failure
+                exc = exc2
+                continue
+        raise RuntimeError(
+            f"giving up after {self.max_retries} reconnect attempts at byte "
+            f"offset {self._raw_offset}: {exc}"
+        ) from exc
 
     def _fill(self) -> None:
         if self._eof:
@@ -528,14 +962,23 @@ class HttpByteStream:
             except StopIteration:
                 self._eof = True
                 return
+            except Exception as exc:  # connection reset, chunked-encoding error, read timeout...
+                self._reconnect(exc)
+                return  # caller's while-loop calls _fill() again against the new connection
             if block:
                 self._buf.extend(block)
+                self._raw_offset += len(block)
         else:
-            block = self._resp.read(self.chunk_size)  # type: ignore[union-attr]
+            try:
+                block = self._resp.read(self.chunk_size)  # type: ignore[union-attr]
+            except Exception as exc:
+                self._reconnect(exc)
+                return
             if not block:
                 self._eof = True
                 return
             self._buf.extend(block)
+            self._raw_offset += len(block)
 
     def read(self, n: int) -> bytes:
         while len(self._buf) < n and not self._eof:
@@ -793,16 +1236,16 @@ def writer_inflate_db_to_ring(
         raise
 
 
-def stream_rds_zip_carve(
+def _run_zip_carve_pipeline(
     url: str,
+    sink: object,
     *,
-    member: Optional[str] = None,
-    ring_mb: int = DEFAULT_RING_MB,
-    chunk_size: int = CHUNK_SIZE,
-    max_keep: int = 2_000_000,
-    timeout: int = 600,
-) -> Set[str]:
-    """Two-thread pipeline: writer → ring → SQLite page carve reader."""
+    member: Optional[str],
+    ring_mb: int,
+    chunk_size: int,
+    timeout: int,
+) -> None:
+    """Two-thread pipeline: writer → ring → SQLite page carve reader → sink."""
     mem = member if member is not None else DEFAULT_ZIP_MEMBER
     ring = ByteRing(ring_mb * 1024 * 1024)
     print(
@@ -823,12 +1266,367 @@ def stream_rds_zip_carve(
     t = threading.Thread(target=run_writer, name="zip-db-writer", daemon=True)
     t.start()
     try:
-        accepted = carve_sqlite_stream_from_ring(ring, max_keep=max_keep)
+        carve_sqlite_stream_from_ring(ring, sink)
     finally:
-        t.join(timeout=timeout + 120)
+        t.join(timeout=max(timeout + 120, 3600))
     if errors:
         raise errors[0]
-    return accepted
+
+
+def stream_rds_zip_carve(
+    url: str,
+    *,
+    member: Optional[str] = None,
+    ring_mb: int = DEFAULT_RING_MB,
+    chunk_size: int = CHUNK_SIZE,
+    max_keep: int = 0,
+    timeout: int = 600,
+) -> Set[str]:
+    """Zip carve into an in-memory set (use max_keep>0 to cap; 0=unlimited RAM)."""
+    sink = MemoryDigestSink(max_keep=max_keep)
+    _run_zip_carve_pipeline(
+        url,
+        sink,
+        member=member,
+        ring_mb=ring_mb,
+        chunk_size=chunk_size,
+        timeout=timeout,
+    )
+    return sink.accepted
+
+
+class PartUploader:
+    """
+    Watches a parts_dir for completed part_NNNNN_<algo>.bin chunks (written
+    atomically via tmp+rename by the native engine) and uploads+deletes each
+    one as it appears, so the scatter-gather architecture actually keeps the
+    runner's local disk footprint bounded -- checkpointing alone only helps
+    if the resulting part file doesn't just sit there and pile up too.
+
+    upload_cmd is a shell command template with a single "{path}" placeholder,
+    e.g.:  gh release upload chunks-1234 "{path}" --clobber
+    If upload_cmd is None, parts are left in place (useful for local runs /
+    inspecting output) and this class does nothing.
+
+    Failed uploads are retried on the next poll -- the file is only deleted
+    after a confirmed-successful upload, so a transient `gh`/network failure
+    loses no data, it just delays that one part's disk reclaim.
+    """
+
+    def __init__(
+        self, parts_dir: Path, upload_cmd: Optional[str], poll_interval: float = 5.0
+    ) -> None:
+        self.parts_dir = parts_dir
+        self.upload_cmd = upload_cmd
+        self.poll_interval = poll_interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name="part-uploader", daemon=True
+        )
+        self.uploaded = 0
+        self.failed = 0
+
+    def start(self) -> None:
+        if self.upload_cmd:
+            self._thread.start()
+
+    def _candidates(self) -> List[Path]:
+        return sorted(
+            p for p in self.parts_dir.glob("part_*.bin") if not p.name.endswith(".tmp")
+        )
+
+    def _upload_one(self, path: Path) -> bool:
+        cmd = self.upload_cmd.format(path=str(path))  # type: ignore[union-attr]
+        try:
+            res = subprocess.run(
+                shlex.split(cmd), capture_output=True, text=True, timeout=300
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"    [upload] {path.name}: exception {exc}", file=sys.stderr)
+            return False
+        if res.returncode != 0:
+            print(
+                f"    [upload] {path.name}: failed rc={res.returncode} "
+                f"{res.stderr.strip()[:300]}",
+                file=sys.stderr,
+            )
+            return False
+        print(
+            f"    [upload] {path.name}: uploaded ({path.stat().st_size} bytes)",
+            file=sys.stderr,
+        )
+        return True
+
+    def _drain_once(self) -> None:
+        for p in self._candidates():
+            if self._upload_one(p):
+                self.uploaded += 1
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            else:
+                self.failed += 1
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self._drain_once()
+            self._stop.wait(self.poll_interval)
+        self._drain_once()  # final drain after stop() so the last parts go out
+
+    def stop_and_join(self, timeout: float = 900.0) -> None:
+        if not self.upload_cmd:
+            return
+        self._stop.set()
+        self._thread.join(timeout=timeout)
+        if self._thread.is_alive():
+            print(
+                "    [upload] warning: uploader thread did not finish "
+                "draining within timeout; parts may remain local",
+                file=sys.stderr,
+            )
+
+
+def writer_inflate_db_to_engine(
+    url: str,
+    engine: object,
+    *,
+    member: Optional[str],
+    chunk_size: int,
+    timeout: int,
+    http_max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+) -> None:
+    """Producer: zip HTTP → inflate target .db → native CarveEngine.write (ping-pong)."""
+    try:
+        with HttpByteStream(
+            url, chunk_size=chunk_size, timeout=timeout, max_retries=http_max_retries
+        ) as stream:
+            name, method, comp_size, has_data_desc = _walk_zip_to_member(
+                stream, member, chunk_size
+            )
+            print(
+                f"    [writer] inflating {name} (method={method}) → ping-pong "
+                f"arenas={engine.arena_bytes / (1024 * 1024):.0f}MiB x2, "
+                f"workers={engine.worker_count}, bucket_cap={engine.bucket_cap}",
+                file=sys.stderr,
+            )
+            for block in _inflate_zip_entry(
+                stream, method, comp_size, has_data_desc, chunk_size
+            ):
+                engine.write(block)
+        engine.close_writer()
+        print("    [writer] EOF / close_writer", file=sys.stderr)
+    except BaseException as exc:
+        try:
+            engine.fail(str(exc))
+        except Exception:
+            pass
+        raise
+
+
+def stream_rds_zip_carve_full(
+    url: str,
+    out_dir: Path,
+    *,
+    member: Optional[str] = None,
+    ring_mb: int = DEFAULT_RING_MB,
+    chunk_size: int = CHUNK_SIZE,
+    timeout: int = 600,
+    text: bool = False,
+    spool_dir: Optional[Path] = None,
+    unique_memory_items: int = DEFAULT_UNIQUE_MEMORY_ITEMS,
+    workers: int = 0,
+    bucket_cap: Optional[int] = None,
+    bucket_ram_budget_mb: int = DEFAULT_BUCKET_RAM_BUDGET_MB,
+    parts_dir: Optional[Path] = None,
+    checkpoint_mb: int = 1536,
+    upload_cmd: Optional[str] = None,
+    http_max_retries: int = DEFAULT_HTTP_MAX_RETRIES,
+) -> Dict[str, int]:
+    """
+    Full modern.db carve with native C++ engine (no caps / no skipped leaf hashes).
+
+    Ping-pong arenas + thread-local 256 buckets + disk shard flush + final
+    per-shard sort/unique → CVT1. Set CVT_FORCE_PYTHON=1 for Python fallback.
+
+    Scatter-gather mode (parts_dir set): instead of accumulating shard files
+    for the entire ~400+ GiB decompressed DB and merging once at the end
+    (risking the free-runner disk cap), the native engine compacts+empties
+    shards into a part_NNNNN_{md5,sha1,sha256}.bin triple every checkpoint_mb
+    MiB, and each part is immediately uploaded (via upload_cmd) and deleted
+    locally. clean_*.bin is NOT produced by this call in that mode -- a
+    separate job (tools/merge_cvt1_parts.py) downloads every part and does
+    the true cross-part exact-unique merge.
+
+    bucket_cap=None (default) derives the TLS bucket capacity from
+    bucket_ram_budget_mb and the actual worker count instead of using a flat
+    constant that could be too large for a high-core-count runner (see
+    compute_dynamic_bucket_cap). Pass an explicit int to override.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    force_py = os.environ.get("CVT_FORCE_PYTHON", "").strip() in ("1", "true", "TRUE")
+
+    if not force_py:
+        try:
+            import cvt_carve  # type: ignore
+        except ImportError as exc:
+            raise RuntimeError(
+                "native module cvt_carve is required for full-scan. "
+                "Build it with: pip install .  "
+                "(or set CVT_FORCE_PYTHON=1 for the slower Python path)"
+            ) from exc
+
+        tmp_root = (
+            Path(spool_dir)
+            if spool_dir
+            else Path(tempfile.mkdtemp(prefix="cvt_native_"))
+        )
+        own_tmp = spool_dir is None
+        shard_dir = tmp_root / "shards"
+        shard_dir.mkdir(parents=True, exist_ok=True)
+
+        parts_path: Optional[Path] = Path(parts_dir) if parts_dir else None
+        uploader: Optional[PartUploader] = None
+        if parts_path:
+            parts_path.mkdir(parents=True, exist_ok=True)
+            uploader = PartUploader(parts_path, upload_cmd)
+            uploader.start()
+            if not upload_cmd:
+                print(
+                    "    [full] parts_dir set without --upload-cmd: parts will "
+                    "accumulate locally under "
+                    f"{parts_path} instead of being uploaded+deleted",
+                    file=sys.stderr,
+                )
+
+        try:
+            cores = cvt_carve.hardware_concurrency()
+            effective_workers = workers if workers and workers > 0 else cores
+            if bucket_cap is None:
+                resolved_bucket_cap = compute_dynamic_bucket_cap(
+                    effective_workers, bucket_ram_budget_mb
+                )
+                worst_case_mib = (
+                    effective_workers
+                    * NATIVE_SHARD_COUNT
+                    * resolved_bucket_cap
+                    * AVG_DIGEST_BYTES
+                    / (1024 * 1024)
+                )
+                print(
+                    f"    [full] dynamic bucket_cap={resolved_bucket_cap} "
+                    f"(workers={effective_workers}, ram_budget_MiB={bucket_ram_budget_mb}, "
+                    f"worst-case bucket RAM≈{worst_case_mib:.0f}MiB)",
+                    file=sys.stderr,
+                )
+            else:
+                resolved_bucket_cap = int(bucket_cap)
+            arena_bytes = max(8, int(ring_mb)) * 1024 * 1024
+            engine = cvt_carve.CarveEngine(
+                str(shard_dir),
+                arena_bytes,
+                workers,
+                resolved_bucket_cap,
+                str(parts_path) if parts_path else "",
+                max(8, int(checkpoint_mb)) * 1024 * 1024,
+            )
+            print(
+                f"    [full] native cvt_carve  cores={cores} "
+                f"workers={engine.worker_count} "
+                f"arena_MiB={engine.arena_bytes / (1024 * 1024):.0f} x2 "
+                f"bucket_cap={engine.bucket_cap}  (full scan, no caps)"
+                + (
+                    f"  chunked=on checkpoint_MiB={engine.checkpoint_bytes / (1024 * 1024):.0f}"
+                    if engine.chunked
+                    else "  chunked=off"
+                ),
+                file=sys.stderr,
+            )
+            mem = member if member is not None else DEFAULT_ZIP_MEMBER
+            errors: List[BaseException] = []
+
+            def run_writer() -> None:
+                try:
+                    writer_inflate_db_to_engine(
+                        url,
+                        engine,
+                        member=mem,
+                        chunk_size=chunk_size,
+                        timeout=timeout,
+                        http_max_retries=http_max_retries,
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            t = threading.Thread(target=run_writer, name="zip-db-writer", daemon=True)
+            t.start()
+            t.join(timeout=None)
+            if errors:
+                raise errors[0]
+
+            if engine.chunked:
+                raw_counts = engine.finalize_chunked()
+                if uploader:
+                    uploader.stop_and_join()
+                print(
+                    f"    [full] chunked mode: {engine.parts_written} part "
+                    f"group(s) written to {parts_path} "
+                    f"(uploaded={uploader.uploaded if uploader else 0}, "
+                    f"failed={uploader.failed if uploader else 0})",
+                    file=sys.stderr,
+                )
+                counts = {k: int(v) for k, v in raw_counts.items()}
+                for name, n in counts.items():
+                    print(f"    [full] last part {name}: {n}", file=sys.stderr)
+                return counts
+
+            ts = int(time.time())
+            raw_counts = engine.write_packs(str(out_dir.resolve()), ts)
+            counts = {
+                k: int(v)
+                for k, v in raw_counts.items()
+                if k.endswith(".bin")
+            }
+            if text:
+                print(
+                    "    [full] note: use tools/cvt1_to_text.py / export-txt jobs "
+                    "for DFIR .txt (keeps disk under limit)",
+                    file=sys.stderr,
+                )
+            for name, n in counts.items():
+                print(f"    [full] {name}: {n}", file=sys.stderr)
+            return counts
+        finally:
+            if uploader:
+                uploader.stop_and_join(timeout=60.0)
+            if own_tmp:
+                shutil.rmtree(tmp_root, ignore_errors=True)
+
+    # ----- Python fallback (explicit only) -----
+    tmp_root = Path(spool_dir) if spool_dir else Path(tempfile.mkdtemp(prefix="cvt_unique_"))
+    own_tmp = spool_dir is None
+    try:
+        print(
+            f"    [full] PYTHON fallback external unique at {tmp_root} "
+            f"(memory_items={unique_memory_items})",
+            file=sys.stderr,
+        )
+        with ExternalUniqueSink(
+            tmp_root / "runs", memory_items=unique_memory_items
+        ) as sink:
+            _run_zip_carve_pipeline(
+                url,
+                sink,
+                member=member,
+                ring_mb=ring_mb,
+                chunk_size=chunk_size,
+                timeout=timeout,
+            )
+            return finalize_external_unique_to_packs(sink, out_dir, text=text)
+    finally:
+        if own_tmp:
+            shutil.rmtree(tmp_root, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -896,6 +1694,8 @@ def filter_hashes_from_text_chunks(
 ) -> Set[str]:
     pending = bytearray()
     accepted: Set[str] = set()
+    # max_keep <= 0 means unlimited
+    capped = max_keep > 0
 
     def consume(text_bytes: bytes, final: bool = False) -> bool:
         nonlocal pending
@@ -912,14 +1712,14 @@ def filter_hashes_from_text_chunks(
             dig = line_filter(raw.decode("utf-8", errors="ignore"))
             if dig and dig not in accepted:
                 accepted.add(dig)
-                if len(accepted) >= max_keep:
+                if capped and len(accepted) >= max_keep:
                     return True
         if final and pending:
             dig = line_filter(bytes(pending).decode("utf-8", errors="ignore"))
             pending.clear()
             if dig:
                 accepted.add(dig)
-        return len(accepted) >= max_keep
+        return bool(capped and len(accepted) >= max_keep)
 
     for chunk in chunks:
         if consume(chunk):
@@ -977,10 +1777,12 @@ def stream_filter_hashes(
     mode: str = "carve",
     ring_mb: int = DEFAULT_RING_MB,
     chunk_size: int = CHUNK_SIZE,
-    max_keep: int = 2_000_000,
+    max_keep: int = 0,
     timeout: int = 600,
 ) -> Set[str]:
     enc = guess_encoding(url, encoding)
+    # 0 = unlimited for memory paths; zip full-scan uses stream_rds_zip_carve_full.
+    mem_cap = max_keep if max_keep > 0 else 0
 
     if enc == "zip":
         if mode == "sqlite-disk":
@@ -988,7 +1790,7 @@ def stream_filter_hashes(
                 url,
                 member=zip_member,
                 chunk_size=chunk_size,
-                max_keep=max_keep,
+                max_keep=mem_cap if mem_cap else 2_000_000,
                 timeout=timeout,
             )
         return stream_rds_zip_carve(
@@ -996,7 +1798,7 @@ def stream_filter_hashes(
             member=zip_member,
             ring_mb=ring_mb,
             chunk_size=chunk_size,
-            max_keep=max_keep,
+            max_keep=mem_cap,
             timeout=timeout,
         )
 
@@ -1144,7 +1946,79 @@ def main() -> int:
         help=f"ring buffer MiB (default {DEFAULT_RING_MB}; use 10240 only if RAM allows)",
     )
     ap.add_argument("--chunk-size", type=int, default=CHUNK_SIZE)
-    ap.add_argument("--max-keep", type=int, default=2_000_000)
+    ap.add_argument(
+        "--max-keep",
+        type=int,
+        default=0,
+        help="0=full zip carve via exact online unique (default); >0=in-memory cap",
+    )
+    ap.add_argument(
+        "--unique-memory-items",
+        type=int,
+        default=DEFAULT_UNIQUE_MEMORY_ITEMS,
+        help=(
+            "Python fallback only (CVT_FORCE_PYTHON=1): max digests in RAM "
+            f"before spill (default {DEFAULT_UNIQUE_MEMORY_ITEMS})"
+        ),
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="native carve worker threads (0=hardware_concurrency / runner cores)",
+    )
+    ap.add_argument(
+        "--bucket-cap",
+        type=int,
+        default=None,
+        help=(
+            "native L1 per-shard bucket capacity before sort/unique flush to disk. "
+            "Default: derived from --bucket-ram-budget-mb and the actual worker "
+            "count (see compute_dynamic_bucket_cap) instead of a flat constant."
+        ),
+    )
+    ap.add_argument(
+        "--bucket-ram-budget-mb",
+        type=int,
+        default=DEFAULT_BUCKET_RAM_BUDGET_MB,
+        help=(
+            "target ceiling for worst-case TLS bucket RAM "
+            f"(workers × 256 shards × bucket_cap × ~{AVG_DIGEST_BYTES} bytes); "
+            "only used when --bucket-cap is not given"
+        ),
+    )
+    ap.add_argument(
+        "--http-max-retries",
+        type=int,
+        default=DEFAULT_HTTP_MAX_RETRIES,
+        help="reconnect attempts (Range-resume, exponential backoff) per connection drop",
+    )
+    ap.add_argument(
+        "--parts-dir",
+        default=None,
+        help=(
+            "enable scatter-gather chunked mode: periodically compact shards "
+            "into part_NNNNN_{md5,sha1,sha256}.bin here instead of merging "
+            "once at the end. Requires --upload-cmd to actually keep local "
+            "disk usage bounded; without it parts just accumulate here."
+        ),
+    )
+    ap.add_argument(
+        "--checkpoint-mb",
+        type=int,
+        default=1536,
+        help="chunked mode: MiB of resident shard data before a checkpoint (default 1536)",
+    )
+    ap.add_argument(
+        "--upload-cmd",
+        default=None,
+        help=(
+            "chunked mode: shell command template with a {path} placeholder, "
+            "run once per completed part; the part is deleted locally only "
+            "after this command exits 0, e.g.: "
+            '\'gh release upload chunks-feed "{path}" --clobber\''
+        ),
+    )
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("-o", "--output", default="clean_packs")
     ap.add_argument("--format", choices=("bin", "text"), default="bin")
@@ -1160,14 +2034,47 @@ def main() -> int:
         url = args.url
 
     enc = guess_encoding(url, args.encoding)
+    use_full_spool = (
+        enc == "zip" and args.mode == "carve" and args.max_keep == 0
+    )
     print(
         f"[*] {url}\n"
         f"    encoding={enc} mode={args.mode} ring_mb={args.ring_mb} "
-        f"max_keep={args.max_keep}",
+        f"max_keep={args.max_keep}"
+        f"{' full_unique=on' if use_full_spool else ''}"
+        f"{f' unique_memory_items={args.unique_memory_items}' if use_full_spool else ''}"
+        f"{f' workers={args.workers}' if use_full_spool else ''}",
         file=sys.stderr,
     )
 
+    out = Path(args.output)
     try:
+        if use_full_spool:
+            counts = stream_rds_zip_carve_full(
+                url,
+                out,
+                member=args.member,
+                ring_mb=args.ring_mb,
+                chunk_size=args.chunk_size,
+                timeout=args.timeout,
+                text=(args.format == "text"),
+                unique_memory_items=args.unique_memory_items,
+                workers=args.workers,
+                bucket_cap=args.bucket_cap,
+                bucket_ram_budget_mb=args.bucket_ram_budget_mb,
+                parts_dir=args.parts_dir,
+                checkpoint_mb=args.checkpoint_mb,
+                upload_cmd=args.upload_cmd,
+                http_max_retries=args.http_max_retries,
+            )
+            for name, n in counts.items():
+                print(f"[+] {name}: {n}", file=sys.stderr)
+            if args.parts_dir:
+                print(f"[+] CVT1 parts → {Path(args.parts_dir).resolve()}", file=sys.stderr)
+            else:
+                print(f"[+] CVT1 → {out.resolve()}", file=sys.stderr)
+            return 0
+
         accepted = stream_filter_hashes(
             url,
             encoding=args.encoding,
@@ -1183,7 +2090,6 @@ def main() -> int:
         return 2
 
     print(f"[+] Kept {len(accepted)} unique digest(s)", file=sys.stderr)
-    out = Path(args.output)
     if args.format == "text":
         out.mkdir(parents=True, exist_ok=True)
         path = out / "clean_hashes.txt" if out.suffix == "" else out
