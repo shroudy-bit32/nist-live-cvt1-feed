@@ -14,6 +14,11 @@ Default inputs under ./clean_packs:
   clean_md5.bin → clean_md5.txt
   clean_sha1.bin → clean_sha1.txt
   clean_sha256.bin → clean_sha256.txt
+
+Single-pack mode (preferred on free GitHub runners — one bin+txt on disk):
+  python tools/cvt1_to_text.py -i clean_packs clean_sha256.bin
+  python tools/cvt1_to_text.py -i clean_packs clean_sha1.bin
+  python tools/cvt1_to_text.py -i clean_packs clean_md5.bin
 """
 
 from __future__ import annotations
@@ -155,7 +160,10 @@ def main() -> int:
     ap.add_argument(
         "files",
         nargs="*",
-        help="optional .bin paths or basenames (default: clean_md5/sha1/sha256.bin)",
+        help=(
+            "optional .bin paths or basenames "
+            "(default: all three clean_*.bin; pass one name for single-pack convert)"
+        ),
     )
     args = ap.parse_args()
 
