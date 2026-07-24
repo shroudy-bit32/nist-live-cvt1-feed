@@ -87,6 +87,16 @@ jobs:
       - name: Checkout Monorepo Source Code
         uses: actions/checkout@v4
 
+      - name: Log runner hardware (cores, RAM, disk) at job start
+        run: |
+          echo "=== CPU ==="
+          echo "nproc: $(nproc)"
+          lscpu | grep -E "Model name|Socket|Core|Thread" || true
+          echo "=== RAM ==="
+          free -h
+          echo "=== Disk ==="
+          df -h /
+
       - name: Initialize Python Environment
         uses: actions/setup-python@v5
         with:

@@ -40,6 +40,14 @@ PYBIND11_MODULE(cvt_carve, m) {
       .def_property_readonly("checkpoint_bytes",
                              &cvt::CarveEngine::checkpoint_bytes)
       .def_property_readonly("parts_written", &cvt::CarveEngine::parts_written)
+      .def_property_readonly(
+          "carve_seconds", &cvt::CarveEngine::carve_seconds,
+          "cumulative wall-clock time spent carving pages (all workers combined "
+          "wall-clock, not summed per-thread)")
+      .def_property_readonly(
+          "checkpoint_seconds", &cvt::CarveEngine::checkpoint_seconds,
+          "cumulative wall-clock time spent in checkpoint compaction "
+          "(sort+unique across shards, now parallelized across the 3 algos)")
       .def("arena_ptr", &cvt::CarveEngine::arena_ptr, py::arg("idx"),
            "uint8_t* address of ping-pong arena 0 or 1")
       .def(

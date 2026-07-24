@@ -3,11 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <exception>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -36,6 +38,36 @@ inline constexpr std::size_t kDefaultBucketCap = 50000;
 // finish. Keeps local disk footprint bounded regardless of total DB size.
 inline constexpr std::uint64_t kDefaultCheckpointBytes =
     1536ull * 1024ull * 1024ull;
+
+// C++17 has no std::counting_semaphore (that's C++20). Minimal blocking
+// semaphore used to bound checkpoint compaction concurrency to the runner's
+// actual core count -- GitHub-hosted standard runners often have only 2-4
+// vCPUs and constrained disk I/O, so unconditionally spawning one thread per
+// algorithm (always 3) can cause CPU/IO contention instead of speeding
+// things up on a small runner. Acquire before doing algorithm-compaction
+// work, release after; a task that can't acquire a slot waits for one to
+// free up rather than running anyway.
+class BoundedSemaphore {
+ public:
+  explicit BoundedSemaphore(int count) : count_(count) {}
+  void acquire() {
+    std::unique_lock<std::mutex> lock(mu_);
+    cv_.wait(lock, [&] { return count_ > 0; });
+    --count_;
+  }
+  void release() {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      ++count_;
+    }
+    cv_.notify_one();
+  }
+
+ private:
+  std::mutex mu_;
+  std::condition_variable cv_;
+  int count_;
+};
 
 struct ThreadOffer {
   ShardSink* sink;
@@ -82,6 +114,20 @@ public:
   bool chunked() const { return !parts_dir_.empty(); }
   std::uint64_t checkpoint_bytes() const { return checkpoint_bytes_; }
   std::uint64_t parts_written() const { return part_seq_; }
+
+  // Cumulative wall-clock time spent actually carving pages (parallel
+  // thread-pool work) vs. compacting checkpoints (do_checkpoint_), in
+  // seconds. Both run on the single dedicated carve_thread_'s critical
+  // path -- neither overlaps with the *next* arena's network fill, so
+  // together they're the real lower bound on this engine's contribution to
+  // total run time. Compare against the job's total wall-clock: whatever's
+  // left over is time spent waiting on the network/decompressor.
+  double carve_seconds() const {
+    return carve_micros_.load() / 1'000'000.0;
+  }
+  double checkpoint_seconds() const {
+    return checkpoint_micros_.load() / 1'000'000.0;
+  }
 
   void write(const uint8_t* data, std::size_t n) {
     std::size_t off = 0;
@@ -140,13 +186,15 @@ public:
                                             ALGO_SHA256, updated_unix);
     std::fprintf(stderr,
                  "    [cvt_carve] packs md5=%llu sha1=%llu sha256=%llu "
-                 "offered=%llu window_flushed=%llu pages=%llu\n",
+                 "offered=%llu window_flushed=%llu pages=%llu "
+                 "total_carve=%.1fs total_checkpoint=%.1fs\n",
                  static_cast<unsigned long long>(md5_n),
                  static_cast<unsigned long long>(sha1_n),
                  static_cast<unsigned long long>(sha256_n),
                  static_cast<unsigned long long>(sink_.offered()),
                  static_cast<unsigned long long>(sink_.flushed_records()),
-                 static_cast<unsigned long long>(pages_.load()));
+                 static_cast<unsigned long long>(pages_.load()),
+                 carve_seconds(), checkpoint_seconds());
     return {{"clean_md5.bin", md5_n},
             {"clean_sha1.bin", sha1_n},
             {"clean_sha256.bin", sha256_n},
@@ -177,26 +225,73 @@ private:
   // more at the very end via finalize_chunked(). Each part is independently
   // exact-unique (no duplicates within itself) but not deduped against other
   // parts -- that happens in the separate merge step.
+  //
+  // The three algorithms touch entirely disjoint shard files and write
+  // entirely disjoint output paths, so they're safe to run concurrently --
+  // but concurrency is capped at min(3, workers_) via a semaphore, not
+  // unconditionally 3: standard GitHub-hosted runners often have only 2-4
+  // vCPUs and constrained disk I/O, so always spawning 3 threads (2 read +
+  // write streams each) can cause CPU/IO contention on a small runner
+  // instead of a speedup. workers_ is the same hardware_concurrency()-
+  // derived (or explicitly overridden) value used to size the carve thread
+  // pool, and carving never overlaps checkpoint compaction in time, so
+  // reusing it here is the correct budget, not a separate guess.
   std::map<std::string, std::uint64_t> do_checkpoint_() {
+    const auto t0 = std::chrono::steady_clock::now();
     const std::uint64_t seq = part_seq_++;
     const std::uint64_t ts = static_cast<std::uint64_t>(std::time(nullptr));
     char seqbuf[16];
     std::snprintf(seqbuf, sizeof(seqbuf), "%05llu",
                   static_cast<unsigned long long>(seq));
     const std::string prefix = parts_dir_ + "/part_" + seqbuf + "_";
-    std::map<std::string, std::uint64_t> counts;
-    counts["md5"] = finalize_algo<16>(prefix + "md5.bin", ALGO_MD5, ts);
-    counts["sha1"] = finalize_algo<20>(prefix + "sha1.bin", ALGO_SHA1, ts);
-    counts["sha256"] = finalize_algo<32>(prefix + "sha256.bin", ALGO_SHA256, ts);
+
+    const int concurrency = static_cast<int>(std::max<unsigned>(1, std::min<unsigned>(3, workers_)));
+    BoundedSemaphore slots(concurrency);
+
+    std::uint64_t md5_n = 0, sha1_n = 0, sha256_n = 0;
+    std::exception_ptr err;
+    std::mutex err_mu;
+    auto run = [&](auto fn) {
+      slots.acquire();
+      try {
+        fn();
+      } catch (...) {
+        std::lock_guard<std::mutex> lock(err_mu);
+        if (!err) err = std::current_exception();
+      }
+      slots.release();
+    };
+    std::thread t_md5([&] {
+      run([&] { md5_n = finalize_algo<16>(prefix + "md5.bin", ALGO_MD5, ts); });
+    });
+    std::thread t_sha1([&] {
+      run([&] { sha1_n = finalize_algo<20>(prefix + "sha1.bin", ALGO_SHA1, ts); });
+    });
+    std::thread t_sha256([&] {
+      run([&] {
+        sha256_n = finalize_algo<32>(prefix + "sha256.bin", ALGO_SHA256, ts);
+      });
+    });
+    t_md5.join();
+    t_sha1.join();
+    t_sha256.join();
+    if (err) std::rethrow_exception(err);
+
     sink_.reset_resident_bytes();
+    const auto t1 = std::chrono::steady_clock::now();
+    checkpoint_micros_ += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
     std::fprintf(stderr,
                  "    [cvt_carve] checkpoint #%llu -> %smd5/sha1/sha256.bin "
-                 "(md5=%llu sha1=%llu sha256=%llu) resident cleared\n",
+                 "(md5=%llu sha1=%llu sha256=%llu) resident cleared in %.2fs "
+                 "concurrency=%d/3 (cumulative carve=%.1fs checkpoint=%.1fs)\n",
                  static_cast<unsigned long long>(seq), prefix.c_str(),
-                 static_cast<unsigned long long>(counts["md5"]),
-                 static_cast<unsigned long long>(counts["sha1"]),
-                 static_cast<unsigned long long>(counts["sha256"]));
-    return counts;
+                 static_cast<unsigned long long>(md5_n),
+                 static_cast<unsigned long long>(sha1_n),
+                 static_cast<unsigned long long>(sha256_n),
+                 std::chrono::duration<double>(t1 - t0).count(), concurrency,
+                 carve_seconds(), checkpoint_seconds());
+    return {{"md5", md5_n}, {"sha1", sha1_n}, {"sha256", sha256_n}};
   }
 
   // Invoked after each arena's carve completes; only the single dedicated
@@ -309,6 +404,7 @@ private:
     }
     if (pages.empty()) return;
 
+    const auto carve_t0 = std::chrono::steady_clock::now();
     const unsigned nthreads = std::min<unsigned>(
         workers_, std::max<unsigned>(1, static_cast<unsigned>(pages.size())));
     std::vector<std::thread> pool;
@@ -329,17 +425,22 @@ private:
       });
     }
     for (auto& th : pool) th.join();
+    const auto carve_t1 = std::chrono::steady_clock::now();
+    carve_micros_ += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(carve_t1 - carve_t0)
+            .count());
 
     const auto p = pages_.load();
     if (p - last_report_ >= 50000) {
       last_report_ = p;
       std::fprintf(stderr,
                    "    [cvt_carve] pages=%llu offered=%llu flushed=%llu "
-                   "db_MiB=%.1f\n",
+                   "db_MiB=%.1f carve=%.1fs checkpoint=%.1fs\n",
                    static_cast<unsigned long long>(p),
                    static_cast<unsigned long long>(sink_.offered()),
                    static_cast<unsigned long long>(sink_.flushed_records()),
-                   db_offset_ / (1024.0 * 1024.0));
+                   db_offset_ / (1024.0 * 1024.0), carve_seconds(),
+                   checkpoint_seconds());
     }
 
     // No other carve is ever in flight concurrently with this one (see
@@ -457,6 +558,8 @@ private:
   std::uint64_t db_offset_ = 0;
   std::atomic<std::uint64_t> pages_{0};
   std::uint64_t last_report_ = 0;
+  std::atomic<std::uint64_t> carve_micros_{0};
+  std::atomic<std::uint64_t> checkpoint_micros_{0};
 };
 
 }  // namespace cvt

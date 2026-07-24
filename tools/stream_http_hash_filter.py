@@ -1559,11 +1559,25 @@ def stream_rds_zip_carve_full(
                 except BaseException as exc:
                     errors.append(exc)
 
+            run_t0 = time.monotonic()
             t = threading.Thread(target=run_writer, name="zip-db-writer", daemon=True)
             t.start()
             t.join(timeout=None)
             if errors:
                 raise errors[0]
+            wall_seconds = time.monotonic() - run_t0
+
+            def _log_timing_breakdown() -> None:
+                carve_s = engine.carve_seconds
+                ckpt_s = engine.checkpoint_seconds
+                other_s = max(0.0, wall_seconds - carve_s - ckpt_s)
+                print(
+                    f"    [full] timing breakdown: wall={wall_seconds:.1f}s "
+                    f"carve={carve_s:.1f}s ({100 * carve_s / max(wall_seconds, 1e-9):.0f}%) "
+                    f"checkpoint={ckpt_s:.1f}s ({100 * ckpt_s / max(wall_seconds, 1e-9):.0f}%) "
+                    f"network/other={other_s:.1f}s ({100 * other_s / max(wall_seconds, 1e-9):.0f}%)",
+                    file=sys.stderr,
+                )
 
             if engine.chunked:
                 raw_counts = engine.finalize_chunked()
@@ -1576,6 +1590,7 @@ def stream_rds_zip_carve_full(
                     f"failed={uploader.failed if uploader else 0})",
                     file=sys.stderr,
                 )
+                _log_timing_breakdown()
                 counts = {k: int(v) for k, v in raw_counts.items()}
                 for name, n in counts.items():
                     print(f"    [full] last part {name}: {n}", file=sys.stderr)
@@ -1583,6 +1598,7 @@ def stream_rds_zip_carve_full(
 
             ts = int(time.time())
             raw_counts = engine.write_packs(str(out_dir.resolve()), ts)
+            _log_timing_breakdown()
             counts = {
                 k: int(v)
                 for k, v in raw_counts.items()
