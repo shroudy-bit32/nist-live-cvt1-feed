@@ -5,14 +5,81 @@ on:
   schedule:
     - cron: '0 0 * * *' # Automatically runs every night at 00:00 UTC
   workflow_dispatch: # Allows manual trigger from the GitHub web UI at any time
+    inputs:
+      force_run:
+        description: >-
+          Run the full carve even if the speed probe projects it won't finish
+          within the 6h budget (probe still runs and reports; this just skips
+          the gate).
+        type: boolean
+        default: false
+      probe_duration_seconds:
+        description: "Speed probe measurement window, in seconds"
+        type: string
+        default: "120"
 
 # Default GITHUB_TOKEN is read-only; release upload needs contents:write.
 permissions:
   contents: write
 
+env:
+  RELEASE_TAG: latest-feed
+  CHUNKS_TAG: chunks-${{ github.run_id }}
+
 jobs:
-  build-and-sync:
+  # -------------------------------------------------------------------------
+  # 0) Speed probe -- measure this runner's REAL sustained throughput to the
+  # actual NIST host before committing 6 hours to a carve that may not
+  # finish. Not a simulation: HEADs the real object, streams real bytes for
+  # probe_duration_seconds, projects total time with a safety margin, and
+  # exposes will_fit as a job output. carve-and-chunk gates on it below, so a
+  # night with bad network luck skips the expensive job instead of burning
+  # runner-hours on a run that was mathematically not going to complete.
+  # -------------------------------------------------------------------------
+  speed-probe:
+    name: Network speed probe
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      will_fit: ${{ steps.probe.outputs.will_fit }}
+      measured_mib_s: ${{ steps.probe.outputs.measured_mib_s }}
+      projected_total_minutes: ${{ steps.probe.outputs.projected_total_minutes }}
+      total_gib: ${{ steps.probe.outputs.total_gib }}
+      zip_url: ${{ steps.probe.outputs.zip_url }}
+
+    steps:
+      - name: Checkout Monorepo Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Measure real sustained throughput to the NIST host
+        id: probe
+        run: |
+          python tools/speed_probe.py \
+            --duration "${{ github.event.inputs.probe_duration_seconds || '120' }}"
+
+  # -------------------------------------------------------------------------
+  # 1) Full NIST modern carve -> scatter-gather part_*.bin chunks (heavy job)
+  #
+  # Scatter-gather instead of one giant local shard pile: the native engine
+  # compacts (sort+unique, same as the final merge) and empties its shard
+  # files every ~1.5 GiB of resident data, uploading+deleting each part as it
+  # goes. This bounds local disk usage regardless of total DB size, and means
+  # a timeout/crash loses at most the current in-flight checkpoint window,
+  # not the whole run -- everything already uploaded survives.
+  #
+  # Gated on the speed probe: only runs if will_fit=true, or if a manual
+  # dispatch explicitly set force_run=true to try anyway.
+  # -------------------------------------------------------------------------
+  carve-and-chunk:
+    needs: speed-probe
+    if: needs.speed-probe.outputs.will_fit == 'true' || github.event.inputs.force_run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
     permissions:
       contents: write
 
@@ -25,23 +92,99 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Report probe verdict for this run
+        run: |
+          echo "Speed probe: ${{ needs.speed-probe.outputs.measured_mib_s }} MiB/s measured, " \
+               "projected ${{ needs.speed-probe.outputs.projected_total_minutes }} min " \
+               "for ${{ needs.speed-probe.outputs.total_gib }} GiB " \
+               "(will_fit=${{ needs.speed-probe.outputs.will_fit }})"
+          if [ "${{ needs.speed-probe.outputs.will_fit }}" != "true" ]; then
+            echo "::warning::Proceeding via force_run despite the speed probe projecting this won't finish in time."
+          fi
+
       - name: Install Runtime Dependencies
         run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake
           python -m pip install --upgrade pip
-          pip install requests
+          pip install requests pybind11 scikit-build-core
+          # Native parallel carver (C++17 / pybind11) — no Python max-keep
+          pip install .
 
-      - name: Execute In-Memory Stream Parser
+      - name: Create scratch chunks release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Auto-discovers newest full RDS_*_modern.zip (skips minimal/delta),
-          # then streams it into native CVT1 packs under ./clean_packs
-          python tools/stream_http_hash_filter.py --latest-modern -o clean_packs
+          gh release create "${{ env.CHUNKS_TAG }}" \
+            --title "Scratch CVT1 chunks (run ${{ github.run_id }})" \
+            --notes "Transient scatter-gather parts; deleted by the merge-parts job. Not for direct use." \
+            --prerelease
 
-      - name: Deploy Native CVT1 Binary Feed to GitHub Releases
+      - name: Execute Chunked Full-Scan Stream Parser
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Native C++: ping-pong arenas, TLS 256 buckets, periodic
+          # checkpoint -> part_NNNNN_{md5,sha1,sha256}.bin, immediate
+          # upload+delete. No max-keep / no artificial caps on coverage.
+          # Reuses the exact URL the speed probe just measured against
+          # (rather than re-discovering "latest" a second time) so the
+          # projection and the actual run are guaranteed to be the same file.
+          mkdir -p chunks
+          python tools/stream_http_hash_filter.py "${{ needs.speed-probe.outputs.zip_url }}" \
+            --parts-dir chunks \
+            --checkpoint-mb 1536 \
+            --upload-cmd 'gh release upload "${{ env.CHUNKS_TAG }}" "{path}" --clobber'
+
+  # -------------------------------------------------------------------------
+  # 2) Merge all chunks -> final exact-unique clean_*.bin (light, no C++ build)
+  #
+  # External k-way merge over already-sorted parts (merge_sorted_raw_runs) --
+  # not an in-memory set -- so this stays cheap regardless of total hash count.
+  # -------------------------------------------------------------------------
+  merge-parts:
+    needs: carve-and-chunk
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Monorepo Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download all chunk parts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p chunks_dl
+          gh release download "${{ env.CHUNKS_TAG }}" \
+            --pattern "part_*.bin" \
+            --dir chunks_dl
+
+      - name: Merge parts -> clean_*.bin
+        run: |
+          python tools/merge_cvt1_parts.py -i chunks_dl -o clean_packs
+
+      - name: Deploy CVT1 Binary Packs to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: latest-feed
+          tag_name: ${{ env.RELEASE_TAG }}
           name: "Latest Clean Hash Feed (CVT1 Packs)"
-          body: "Automated 24h zero-footprint binary hash feed generation for the core scanning engine."
+          body: |
+            Automated zero-footprint binary hash feed (CVT1).
+
+            - `.bin` packs are produced by merging the scatter-gather chunk
+              parts from the full modern RDS carve job (one exact-unique
+              k-way merge across all parts, no in-memory set).
+            - DFIR `.txt` lists (Magnet AXIOM / FTK) are attached by follow-up
+              jobs that convert one algorithm at a time from these binaries
+              (keeps free-runner disk under the limit).
           make_latest: true
           files: |
             clean_packs/clean_md5.bin
@@ -50,3 +193,62 @@ jobs:
           fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete scratch chunks release
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ env.CHUNKS_TAG }}" --yes --cleanup-tag
+
+  # -------------------------------------------------------------------------
+  # 3) Per-algo DFIR text export (light jobs; one .bin + one .txt on disk)
+  # -------------------------------------------------------------------------
+  export-txt:
+    name: Export ${{ matrix.pack }}.txt
+    needs: merge-parts
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        pack:
+          - clean_sha256
+          - clean_sha1
+          - clean_md5
+
+    steps:
+      - name: Checkout Monorepo Source Code
+        uses: actions/checkout@v4
+
+      - name: Initialize Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Download ${{ matrix.pack }}.bin from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p clean_packs
+          gh release download "${{ env.RELEASE_TAG }}" \
+            --pattern "${{ matrix.pack }}.bin" \
+            --dir clean_packs \
+            --clobber
+
+      - name: Convert ${{ matrix.pack }}.bin → .txt
+        run: |
+          # Single-pack convert keeps peak disk ≈ one bin + one txt
+          python tools/cvt1_to_text.py -i clean_packs -o clean_packs \
+            "${{ matrix.pack }}.bin"
+
+      - name: Attach ${{ matrix.pack }}.txt to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ env.RELEASE_TAG }}" \
+            "clean_packs/${{ matrix.pack }}.txt" \
+            --clobber
