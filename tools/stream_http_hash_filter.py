@@ -23,10 +23,15 @@ Ring size default is 512 MiB (safe on ~7 GiB GHA runners). Use --ring-mb
 
 Full-scan path (default for zip carve, --max-keep 0)
 ----------------------------------------------------
-Do NOT keep millions of digests in a Python set. Append raw MD5/SHA-1/SHA-256
-bytes to temp spools while carving, then shard-by-first-byte → in-memory
-unique per shard → sorted CVT1 packs. Fits free GitHub runner disk/RAM while
-covering the entire modern.db leaf stream.
+Exact online unique (no hash loss, free-runner safe):
+
+  Carve → in-memory set (dedup window) → spill sorted unique runs to disk
+       → k-way merge unique → CVT1 packs
+
+NSRL modern has ~940M FILE rows but only ~72M distinct SHA-256. Filtering
+duplicates online keeps peak disk near the unique payload (~5 GiB), not the
+duplicate-inflated row count. Bloom-skip is intentionally NOT used for drops:
+false positives would lose real hashes.
 
 Also supports: gzip/text feeds; optional --mode sqlite-disk (temp .db + SQL).
 """
@@ -34,6 +39,7 @@ Also supports: gzip/text feeds; optional --mode sqlite-disk (temp .db + SQL).
 from __future__ import annotations
 
 import argparse
+import heapq
 import os
 import re
 import shutil
@@ -314,8 +320,11 @@ class ByteRing:
 
 
 # ---------------------------------------------------------------------------
-# Digest sinks: in-memory (capped) or disk spool (full scan)
+# Digest sinks: in-memory (capped) or external unique (full scan)
 # ---------------------------------------------------------------------------
+
+DEFAULT_UNIQUE_MEMORY_ITEMS = 4_000_000
+
 
 class MemoryDigestSink:
     """In-RAM unique digests. Optional max_keep > 0 stops the carve early."""
@@ -343,35 +352,57 @@ class MemoryDigestSink:
         return bool(self.max_keep and len(self.accepted) >= self.max_keep)
 
 
-class SpoolDigestSink:
+class ExternalUniqueSink:
     """
-    Append raw digests directly into 256 first-byte shards per algo.
-    Avoids a 2× flat-spool rewrite so peak disk stays ~one copy of raw digests.
+    Exact online unique for full NSRL carve (no false drops).
+
+    Flow:
+      offer → per-algo in-memory set (drops dups in the current window)
+           → when memory_items is hit, spill each non-empty set as a sorted
+             unique run file
+           → close() spills remainder
+           → merge_sorted_raw_runs() k-way merges runs with exact unique
+
+    Peak disk ≈ unique digest payload (+ brief merge output), not ~940M rows.
     """
 
-    N_SHARDS = 256
-
-    def __init__(self, directory: Path) -> None:
+    def __init__(
+        self,
+        directory: Path,
+        memory_items: int = DEFAULT_UNIQUE_MEMORY_ITEMS,
+    ) -> None:
+        if memory_items < 10_000:
+            raise ValueError("memory_items must be >= 10000")
         self.directory = directory
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._fh: Dict[Tuple[int, int], object] = {}
-        self.raw_counts: Dict[int, int] = {16: 0, 20: 0, 32: 0}
+        self.memory_items = memory_items
+        self.sets: Dict[int, Set[bytes]] = {16: set(), 20: set(), 32: set()}
+        self.runs: Dict[int, List[Path]] = {16: [], 20: [], 32: []}
+        self.offered: int = 0
+        self.duplicates_dropped: int = 0
+        self.unique_accepted: int = 0  # first-seen into memory (pre-cross-run dups)
+        self.spilled_records: int = 0
+        self._run_seq = 0
+        self._closed = False
 
-    def _shard_path(self, digest_size: int, shard: int) -> Path:
-        return self.directory / f"s{digest_size}_{shard:02x}.raw"
+    def _mem_count(self) -> int:
+        return sum(len(s) for s in self.sets.values())
 
     def offer_raw(self, raw: bytes) -> bool:
+        if self._closed:
+            raise RuntimeError("ExternalUniqueSink is closed")
         n = len(raw)
-        if n not in self.raw_counts:
+        bucket = self.sets.get(n)
+        if bucket is None:
             return True
-        shard = raw[0]
-        key = (n, shard)
-        fh = self._fh.get(key)
-        if fh is None:
-            fh = self._shard_path(n, shard).open("wb")
-            self._fh[key] = fh
-        fh.write(raw)  # type: ignore[attr-defined]
-        self.raw_counts[n] += 1
+        self.offered += 1
+        if raw in bucket:
+            self.duplicates_dropped += 1
+            return True
+        bucket.add(raw)
+        self.unique_accepted += 1
+        if self._mem_count() >= self.memory_items:
+            self._spill_all()
         return True
 
     def offer_hex(self, h: str) -> bool:
@@ -383,46 +414,103 @@ class SpoolDigestSink:
     def stopped(self) -> bool:
         return False
 
-    def close(self) -> None:
-        for fh in self._fh.values():
-            try:
-                fh.close()  # type: ignore[attr-defined]
-            except Exception:
-                pass
-        self._fh.clear()
+    def _spill_size(self, size: int) -> None:
+        bucket = self.sets[size]
+        if not bucket:
+            return
+        path = self.directory / f"run_{size}_{self._run_seq:04d}.raw"
+        self._run_seq += 1
+        with path.open("wb") as fh:
+            for dig in sorted(bucket):
+                fh.write(dig)
+        n = len(bucket)
+        self.spilled_records += n
+        self.runs[size].append(path)
+        bucket.clear()
+        print(
+            f"    [unique] spill size={size} records={n} "
+            f"runs={len(self.runs[size])} offered={self.offered} "
+            f"dropped_dup={self.duplicates_dropped}",
+            file=sys.stderr,
+        )
 
-    def __enter__(self) -> "SpoolDigestSink":
+    def _spill_all(self) -> None:
+        for size in (16, 20, 32):
+            self._spill_size(size)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._spill_all()
+        self._closed = True
+
+    def __enter__(self) -> "ExternalUniqueSink":
         return self
 
     def __exit__(self, *args: object) -> None:
         self.close()
 
+    def stats_line(self) -> str:
+        return (
+            f"offered={self.offered} mem_unique={self._mem_count()} "
+            f"accepted={self.unique_accepted} dropped_dup={self.duplicates_dropped} "
+            f"runs={sum(len(v) for v in self.runs.values())}"
+        )
 
-def unique_presharded(
-    spool_dir: Path, digest_size: int, dst: Path, raw_count: int
+
+def merge_sorted_raw_runs(
+    runs: List[Path], digest_size: int, dst: Path
 ) -> int:
-    """Unique+sort digests already bucketed by first byte; concat in shard order."""
-    count = 0
-    with dst.open("wb") as out:
-        for shard in range(SpoolDigestSink.N_SHARDS):
-            p = spool_dir / f"s{digest_size}_{shard:02x}.raw"
-            if not p.is_file():
-                continue
-            data = p.read_bytes()
-            p.unlink(missing_ok=True)
-            if not data:
-                continue
-            if len(data) % digest_size:
-                raise RuntimeError(f"{p}: size {len(data)} not multiple of {digest_size}")
-            uniq = sorted(
-                {data[i : i + digest_size] for i in range(0, len(data), digest_size)}
-            )
-            for dig in uniq:
-                out.write(dig)
-            count += len(uniq)
-    if raw_count == 0 and count == 0 and not dst.exists():
+    """K-way merge of sorted unique runs → sorted exact-unique raw file."""
+    if not runs:
         dst.write_bytes(b"")
-    return count
+        return 0
+
+    if len(runs) == 1:
+        src = runs[0]
+        if src.resolve() != dst.resolve():
+            shutil.copyfile(src, dst)
+            src.unlink(missing_ok=True)
+        nbytes = dst.stat().st_size
+        if nbytes % digest_size:
+            raise RuntimeError(f"{dst}: bad size {nbytes}")
+        return nbytes // digest_size
+
+    handles = [p.open("rb") for p in runs]
+    try:
+        heap: List[Tuple[bytes, int]] = []
+        for idx, fh in enumerate(handles):
+            dig = fh.read(digest_size)
+            if not dig:
+                continue
+            if len(dig) != digest_size:
+                raise RuntimeError(f"{runs[idx]}: truncated digest")
+            heapq.heappush(heap, (dig, idx))
+
+        count = 0
+        last: Optional[bytes] = None
+        with dst.open("wb") as out:
+            while heap:
+                dig, idx = heapq.heappop(heap)
+                if dig != last:
+                    out.write(dig)
+                    last = dig
+                    count += 1
+                nxt = handles[idx].read(digest_size)
+                if not nxt:
+                    continue
+                if len(nxt) != digest_size:
+                    raise RuntimeError(f"{runs[idx]}: truncated digest")
+                heapq.heappush(heap, (nxt, idx))
+        return count
+    finally:
+        for fh in handles:
+            fh.close()
+        for p in runs:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def write_cvt1_from_raw(
@@ -447,41 +535,51 @@ def write_cvt1_from_raw(
     return count
 
 
-def finalize_spool_to_packs(
-    spool: SpoolDigestSink,
+def _write_raw_as_text(raw_path: Path, txt_path: Path, digest_size: int) -> None:
+    with raw_path.open("rb") as src, txt_path.open(
+        "w", encoding="ascii", newline="\n"
+    ) as out:
+        while True:
+            block = src.read(digest_size * 8192)
+            if not block:
+                break
+            if len(block) % digest_size:
+                raise RuntimeError(f"{raw_path}: truncated while writing text")
+            for i in range(0, len(block), digest_size):
+                out.write(block[i : i + digest_size].hex())
+                out.write("\n")
+
+
+def finalize_external_unique_to_packs(
+    sink: ExternalUniqueSink,
     out_dir: Path,
     *,
     updated_unix: Optional[int] = None,
     text: bool = False,
 ) -> Dict[str, int]:
-    """Unique+sort pre-sharded spools and write CVT1 .bin (and optional .txt)."""
-    spool.close()
+    """Merge spilled runs to exact-unique raw → CVT1 .bin (+ optional .txt)."""
+    sink.close()
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(updated_unix if updated_unix is not None else time.time())
     counts: Dict[str, int] = {}
+    print(
+        f"    [unique] finalize {sink.stats_line()}",
+        file=sys.stderr,
+    )
     for size in (16, 20, 32):
         algo = ALGO_BY_DIGEST_SIZE[size]
         pack_name = PACK_NAME_BY_ALGO[algo]
-        unique_raw = spool.directory / f"unique_{size}.raw"
+        unique_raw = sink.directory / f"unique_{size}.raw"
+        runs = list(sink.runs[size])
         print(
-            f"    [dedup] size={size}: {spool.raw_counts[size]} raw → unique…",
+            f"    [unique] merge size={size} runs={len(runs)} → {pack_name}",
             file=sys.stderr,
         )
-        n = unique_presharded(
-            spool.directory, size, unique_raw, spool.raw_counts[size]
-        )
+        n = merge_sorted_raw_runs(runs, size, unique_raw)
+        sink.runs[size] = []
         if text:
             txt_path = out_dir / pack_name.replace(".bin", ".txt")
-            with unique_raw.open("rb") as src, txt_path.open(
-                "w", encoding="ascii", newline="\n"
-            ) as out:
-                while True:
-                    block = src.read(size * 8192)
-                    if not block:
-                        break
-                    for i in range(0, len(block), size):
-                        out.write(block[i : i + size].hex())
-                        out.write("\n")
+            _write_raw_as_text(unique_raw, txt_path, size)
             counts[txt_path.name] = n
         bin_path = out_dir / pack_name
         write_cvt1_from_raw(unique_raw, bin_path, algo, ts)
@@ -490,7 +588,15 @@ def finalize_spool_to_packs(
             unique_raw.unlink(missing_ok=True)
         except OSError:
             pass
-        print(f"    [dedup] {pack_name}: {n} unique", file=sys.stderr)
+        print(f"    [unique] {pack_name}: {n} exact unique", file=sys.stderr)
+    drop_pct = (
+        (100.0 * sink.duplicates_dropped / sink.offered) if sink.offered else 0.0
+    )
+    print(
+        f"    [unique] done offered={sink.offered} "
+        f"dropped_dup={sink.duplicates_dropped} ({drop_pct:.1f}%)",
+        file=sys.stderr,
+    )
     return counts
 
 
@@ -670,28 +776,25 @@ def carve_sqlite_stream_from_ring(
         if pages - last_report >= 50000:
             last_report = pages
             if isinstance(sink, MemoryDigestSink):
-                n_show = len(sink.accepted)
-            elif isinstance(sink, SpoolDigestSink):
-                n_show = sum(sink.raw_counts.values())
+                detail = f"unique={len(sink.accepted)}"
+            elif isinstance(sink, ExternalUniqueSink):
+                detail = sink.stats_line()
             else:
-                n_show = -1
+                detail = "digests=?"
             print(
-                f"    [carve] pages={pages} digests={n_show} "
+                f"    [carve] pages={pages} {detail} "
                 f"ring_r={ring.bytes_read / (1024 * 1024):.1f}MiB "
                 f"ring_w={ring.bytes_written / (1024 * 1024):.1f}MiB",
                 file=sys.stderr,
             )
 
     if isinstance(sink, MemoryDigestSink):
-        n_done = len(sink.accepted)
-    elif isinstance(sink, SpoolDigestSink):
-        n_done = sum(sink.raw_counts.values())
+        detail = f"unique={len(sink.accepted)}"
+    elif isinstance(sink, ExternalUniqueSink):
+        detail = sink.stats_line()
     else:
-        n_done = -1
-    print(
-        f"    [carve] done pages={pages} digests={n_done}",
-        file=sys.stderr,
-    )
+        detail = "digests=?"
+    print(f"    [carve] done pages={pages} {detail}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -1071,20 +1174,24 @@ def stream_rds_zip_carve_full(
     timeout: int = 600,
     text: bool = False,
     spool_dir: Optional[Path] = None,
+    unique_memory_items: int = DEFAULT_UNIQUE_MEMORY_ITEMS,
 ) -> Dict[str, int]:
     """
-    Full modern.db carve with disk-backed spool + shard dedup.
-    Safe for free GitHub runners (no multi‑GB Python set).
+    Full modern.db carve with exact online unique (memory set → spill runs → merge).
+    Safe for free GitHub runners: peak disk ≈ unique digests, not duplicate rows.
     """
     out_dir = Path(out_dir)
-    tmp_root = Path(spool_dir) if spool_dir else Path(tempfile.mkdtemp(prefix="cvt_spool_"))
+    tmp_root = Path(spool_dir) if spool_dir else Path(tempfile.mkdtemp(prefix="cvt_unique_"))
     own_tmp = spool_dir is None
     try:
         print(
-            f"    [full] disk spool at {tmp_root} (raw append → shard unique)",
+            f"    [full] external unique at {tmp_root} "
+            f"(memory_items={unique_memory_items})",
             file=sys.stderr,
         )
-        with SpoolDigestSink(tmp_root / "raw") as sink:
+        with ExternalUniqueSink(
+            tmp_root / "runs", memory_items=unique_memory_items
+        ) as sink:
             _run_zip_carve_pipeline(
                 url,
                 sink,
@@ -1093,7 +1200,7 @@ def stream_rds_zip_carve_full(
                 chunk_size=chunk_size,
                 timeout=timeout,
             )
-            return finalize_spool_to_packs(sink, out_dir, text=text)
+            return finalize_external_unique_to_packs(sink, out_dir, text=text)
     finally:
         if own_tmp:
             shutil.rmtree(tmp_root, ignore_errors=True)
@@ -1420,7 +1527,16 @@ def main() -> int:
         "--max-keep",
         type=int,
         default=0,
-        help="0=full zip carve via disk spool+dedup (default); >0=in-memory cap",
+        help="0=full zip carve via exact online unique (default); >0=in-memory cap",
+    )
+    ap.add_argument(
+        "--unique-memory-items",
+        type=int,
+        default=DEFAULT_UNIQUE_MEMORY_ITEMS,
+        help=(
+            "full-scan: max digests held in RAM before spilling a sorted unique "
+            f"run (default {DEFAULT_UNIQUE_MEMORY_ITEMS})"
+        ),
     )
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("-o", "--output", default="clean_packs")
@@ -1444,7 +1560,8 @@ def main() -> int:
         f"[*] {url}\n"
         f"    encoding={enc} mode={args.mode} ring_mb={args.ring_mb} "
         f"max_keep={args.max_keep}"
-        f"{' full_spool=on' if use_full_spool else ''}",
+        f"{' full_unique=on' if use_full_spool else ''}"
+        f"{f' unique_memory_items={args.unique_memory_items}' if use_full_spool else ''}",
         file=sys.stderr,
     )
 
@@ -1459,6 +1576,7 @@ def main() -> int:
                 chunk_size=args.chunk_size,
                 timeout=args.timeout,
                 text=(args.format == "text"),
+                unique_memory_items=args.unique_memory_items,
             )
             for name, n in counts.items():
                 print(f"[+] {name}: {n}", file=sys.stderr)
