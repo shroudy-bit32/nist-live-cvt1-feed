@@ -1,5 +1,8 @@
 # ⚡ NIST NSRL Live CVT1 & DFIR Hash Feed Pipeline
 
+[!NOTE]
+**Disclaimer:** This project and its generated data feeds are an independent, high-performance compression and distribution pipeline for the NIST NSRL dataset. This is **not** an official NIST Reference Data Set (RDS) release, nor is it affiliated with, maintained, or endorsed by the National Institute of Standards and Technology (NIST).
+
 An automated, high-performance, **zero-disk footprint** threat intelligence pipeline that parses the massive (~120 GB) NIST NSRL Modern database entirely in-memory. It generates daily micro-sized native binary hash feeds (CVT1 format) for high-performance engines, alongside **DFIR-compatible plain-text lists** (for Magnet AXIOM, FTK, etc.), deploying them directly to GitHub Releases.
 
 ---
